@@ -1,35 +1,16 @@
----
-title: NEWS BYTE Source Extractor
-emoji: 📰
-colorFrom: blue
-colorTo: indigo
-sdk: docker
-app_port: 7860
----
+# NEWS BYTE Render Extractor 1.2
 
-# NEWS BYTE Source Extractor
+Fixes:
+- Trafilatura 2.2 `Document` handling.
+- Google News RSS `/rss/articles/...` links are resolved to the real publisher URL before extraction.
+- Resolution results are cached to reduce duplicate Google requests.
+- Extraction responses include `requested_url`, `resolved_url`, and `google_resolve`.
 
-Non-AI article extraction server for the NEWS BYTE browser extension.
+Extraction cascade:
+1. Google News URL resolution when needed
+2. HTTP + Trafilatura
+3. JSON-LD / DOM fallbacks
+4. Optional browser rendering when `render=true`
 
-## Endpoint
-
-POST `/extract`
-
-Body:
-
-```json
-{
-  "url": "https://example.com/news/article",
-  "render": true,
-  "max_chars": 60000
-}
-```
-
-The server first uses the fast HTTP + Trafilatura path.
-If extraction is too short/poor, it can render the page with Chromium/Playwright
-and run extraction again.
-
-It returns the source-derived article text, paragraphs, title, image, author,
-publication date and an extraction quality score.
-
-This service does not generate or invent article facts.
+Start:
+`uvicorn app:app --host 0.0.0.0 --port $PORT`
