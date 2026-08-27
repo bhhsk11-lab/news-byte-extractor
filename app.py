@@ -5,6 +5,7 @@ import re
 import socket
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
+import time
 
 import httpx
 import trafilatura
@@ -20,7 +21,7 @@ from pydantic import BaseModel, HttpUrl
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
     description="Non-AI source article extraction service for NEWS BYTE.",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 # NEWS BYTE is a personal extension. CORS is open so the extension can call
@@ -49,6 +50,39 @@ MIN_GOOD_SCORE = 0.30
 GOOGLE_RESOLVE_CACHE = {}
 GOOGLE_RESOLVE_LOCK = asyncio.Lock()
 GOOGLE_RESOLVE_CACHE_MAX = 500
+
+# Reuse HTTP connections across concurrent article requests. This is much
+# faster than creating a new TLS connection for every article.
+HTTP_CLIENT = None
+EXTRACTION_CACHE = {}
+EXTRACTION_CACHE_TTL = 600  # 10 minutes
+EXTRACTION_CACHE_MAX = 300
+EXTRACTION_INFLIGHT = {}
+EXTRACTION_SEMAPHORE = asyncio.Semaphore(8)
+
+
+@app.on_event("startup")
+async def startup_http_client():
+    global HTTP_CLIENT
+    HTTP_CLIENT = httpx.AsyncClient(
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        follow_redirects=True,
+        max_redirects=5,
+        timeout=httpx.Timeout(18.0, connect=8.0),
+        limits=httpx.Limits(max_connections=12, max_keepalive_connections=8, keepalive_expiry=30.0),
+    )
+
+
+@app.on_event("shutdown")
+async def shutdown_http_client():
+    global HTTP_CLIENT
+    if HTTP_CLIENT is not None:
+        await HTTP_CLIENT.aclose()
+        HTTP_CLIENT = None
 
 
 def is_google_news_article_url(url: str) -> bool:
@@ -448,44 +482,28 @@ def extract_article(html: str, url: str, method: str) -> dict:
 
 
 async def fetch_html(url: str):
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
+    client = HTTP_CLIENT
+    if client is None:
+        raise RuntimeError("HTTP client is not ready")
 
-    timeout = httpx.Timeout(20.0, connect=10.0)
+    async with client.stream("GET", url) as response:
+        response.raise_for_status()
 
-    async with httpx.AsyncClient(
-        headers=headers,
-        follow_redirects=True,
-        max_redirects=5,
-        timeout=timeout,
-    ) as client:
-        async with client.stream("GET", url) as response:
-            response.raise_for_status()
+        content_type = response.headers.get("content-type", "").lower()
+        if "html" not in content_type and "xml" not in content_type:
+            raise ValueError("Source response is not HTML")
 
-            content_type = response.headers.get("content-type", "").lower()
-            if "html" not in content_type and "xml" not in content_type:
-                raise ValueError("Source response is not HTML")
+        chunks = []
+        total = 0
 
-            chunks = []
-            total = 0
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if total > MAX_DOWNLOAD_BYTES:
+                raise ValueError("Source HTML is too large")
+            chunks.append(chunk)
 
-            async for chunk in response.aiter_bytes():
-                total += len(chunk)
-
-                if total > MAX_DOWNLOAD_BYTES:
-                    raise ValueError("Source HTML is too large")
-
-                chunks.append(chunk)
-
-            html = b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
-
-            return html, str(response.url)
+        html = b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
+        return html, str(response.url)
 
 
 async def fetch_rendered(url: str):
@@ -516,13 +534,38 @@ async def fetch_rendered(url: str):
 
 async def extract_one(url: str, render: bool, max_chars: int):
     if not is_public_url(url):
-        raise HTTPException(
-            status_code=400,
-            detail="Only public HTTP/HTTPS URLs are allowed.",
-        )
+        raise HTTPException(status_code=400, detail="Only public HTTP/HTTPS URLs are allowed.")
 
+    cache_key = str(url).split("#", 1)[0]
+    cached = EXTRACTION_CACHE.get(cache_key)
+    if cached and (time.monotonic() - cached[0]) < EXTRACTION_CACHE_TTL:
+        result = dict(cached[1])
+        result["cache"] = True
+        return result
+
+    existing = EXTRACTION_INFLIGHT.get(cache_key)
+    if existing is not None:
+        return dict(await existing)
+
+    async def runner():
+        async with EXTRACTION_SEMAPHORE:
+            return await _extract_one_uncached(url, render, max_chars, url)
+
+    task = asyncio.create_task(runner())
+    EXTRACTION_INFLIGHT[cache_key] = task
+    try:
+        result = await task
+        if result.get("ok") or result.get("image"):
+            if len(EXTRACTION_CACHE) >= EXTRACTION_CACHE_MAX:
+                EXTRACTION_CACHE.pop(next(iter(EXTRACTION_CACHE)))
+            EXTRACTION_CACHE[cache_key] = (time.monotonic(), dict(result))
+        return result
+    finally:
+        EXTRACTION_INFLIGHT.pop(cache_key, None)
+
+
+async def _extract_one_uncached(url: str, render: bool, max_chars: int, requested_url: str):
     errors = []
-    requested_url = url
     last_result = None
 
     # Google News RSS gives encoded /rss/articles/ URLs. They usually return a
@@ -614,20 +657,21 @@ async def proxy_image(url: str):
         "Referer": url,
     }
     try:
-        timeout = httpx.Timeout(15.0, connect=8.0)
-        async with httpx.AsyncClient(headers=headers, follow_redirects=True, max_redirects=5, timeout=timeout) as client:
-            r = await client.get(url)
-            r.raise_for_status()
-            ctype = (r.headers.get("content-type") or "").split(";", 1)[0].lower()
-            if not ctype.startswith("image/"):
-                raise HTTPException(status_code=415, detail="URL did not return an image")
-            if len(r.content) > 8_000_000:
-                raise HTTPException(status_code=413, detail="Image is too large")
-            return Response(
-                content=r.content,
-                media_type=ctype,
-                headers={"Cache-Control": "public, max-age=86400, stale-while-revalidate=604800"},
-            )
+        client = HTTP_CLIENT
+        if client is None:
+            raise RuntimeError("HTTP client is not ready")
+        r = await client.get(url, headers=headers, timeout=httpx.Timeout(15.0, connect=8.0))
+        r.raise_for_status()
+        ctype = (r.headers.get("content-type") or "").split(";", 1)[0].lower()
+        if not ctype.startswith("image/"):
+            raise HTTPException(status_code=415, detail="URL did not return an image")
+        if len(r.content) > 8_000_000:
+            raise HTTPException(status_code=413, detail="Image is too large")
+        return Response(
+            content=r.content,
+            media_type=ctype,
+            headers={"Cache-Control": "public, max-age=86400, stale-while-revalidate=604800"},
+        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -638,7 +682,7 @@ async def proxy_image(url: str):
 async def root():
     return {
         "service": "NEWS BYTE Source Extractor",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "ai": False,
         "usage": "POST /extract with {url, render, max_chars}",
     }
