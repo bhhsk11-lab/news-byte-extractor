@@ -8,6 +8,10 @@ from urllib.parse import urlparse
 
 import httpx
 import trafilatura
+try:
+    from googlenewsdecoder import gnewsdecoder
+except Exception:
+    gnewsdecoder = None
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +20,7 @@ from pydantic import BaseModel, HttpUrl
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
     description="Non-AI source article extraction service for NEWS BYTE.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 # NEWS BYTE is a personal extension. CORS is open so the extension can call
@@ -38,6 +42,51 @@ USER_AGENT = (
 MAX_DOWNLOAD_BYTES = 8_000_000
 MIN_GOOD_WORDS = 120
 MIN_GOOD_SCORE = 0.30
+
+# Google News RSS article links are encoded Google redirect URLs, not publisher
+# article URLs. Keep a small in-process cache to avoid resolving the same link
+# repeatedly during a feed refresh.
+GOOGLE_RESOLVE_CACHE = {}
+GOOGLE_RESOLVE_LOCK = asyncio.Lock()
+GOOGLE_RESOLVE_CACHE_MAX = 500
+
+
+def is_google_news_article_url(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        path = urlparse(url).path
+        return host == "news.google.com" and (
+            path.startswith("/rss/articles/") or path.startswith("/articles/") or path.startswith("/read/")
+        )
+    except Exception:
+        return False
+
+
+async def resolve_google_news_url(url: str):
+    """Resolve a Google News RSS redirect to the publisher URL."""
+    if not is_google_news_article_url(url):
+        return url, None
+
+    cached = GOOGLE_RESOLVE_CACHE.get(url)
+    if cached:
+        return cached, "cache"
+
+    if gnewsdecoder is None:
+        return url, "decoder-unavailable"
+
+    try:
+        # The decoder performs Google's current signature/timestamp resolution.
+        result = await asyncio.to_thread(gnewsdecoder, url, interval=0)
+        if isinstance(result, dict) and result.get("status") and result.get("decoded_url"):
+            resolved = str(result["decoded_url"])
+            if is_public_url(resolved):
+                if len(GOOGLE_RESOLVE_CACHE) >= GOOGLE_RESOLVE_CACHE_MAX:
+                    GOOGLE_RESOLVE_CACHE.pop(next(iter(GOOGLE_RESOLVE_CACHE)))
+                GOOGLE_RESOLVE_CACHE[url] = resolved
+                return resolved, "googlenewsdecoder"
+        return url, "decoder-failed"
+    except Exception as exc:
+        return url, "decoder-" + type(exc).__name__
 
 
 class ExtractRequest(BaseModel):
@@ -416,6 +465,14 @@ async def extract_one(url: str, render: bool, max_chars: int):
         )
 
     errors = []
+    requested_url = url
+
+    # Google News RSS gives encoded /rss/articles/ URLs. They usually return a
+    # Google interstitial to plain HTTP clients, so resolve them first.
+    resolved_url, resolve_method = await resolve_google_news_url(url)
+    url = resolved_url
+    if resolve_method and resolve_method not in ("cache", "googlenewsdecoder"):
+        errors.append("google-resolve:" + resolve_method)
 
     # FAST PATH: ordinary HTTP request.
     try:
@@ -426,6 +483,10 @@ async def extract_one(url: str, render: bool, max_chars: int):
             final_url,
             "http+trafilatura",
         )
+        result["requested_url"] = requested_url
+        result["resolved_url"] = final_url
+        result["google_resolve"] = resolve_method
+
 
         if (
             result["word_count"] >= MIN_GOOD_WORDS
@@ -457,7 +518,10 @@ async def extract_one(url: str, render: bool, max_chars: int):
 
     return {
         "ok": False,
-        "url": url,
+        "url": requested_url,
+        "requested_url": requested_url,
+        "resolved_url": url,
+        "google_resolve": resolve_method,
         "title": "",
         "author": "",
         "published": "",
@@ -477,7 +541,7 @@ async def extract_one(url: str, render: bool, max_chars: int):
 async def root():
     return {
         "service": "NEWS BYTE Source Extractor",
-        "version": "1.0.0",
+        "version": "1.2.0",
         "ai": False,
         "usage": "POST /extract with {url, render, max_chars}",
     }
