@@ -16,7 +16,7 @@ from pydantic import BaseModel, HttpUrl
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
     description="Non-AI source article extraction service for NEWS BYTE.",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 # NEWS BYTE is a personal extension. CORS is open so the extension can call
@@ -215,20 +215,47 @@ def extract_article(html: str, url: str, method: str) -> dict:
 
     data = {}
     try:
-        data = (
-            trafilatura.bare_extraction(
-                html,
-                url=url,
-                include_comments=False,
-                include_tables=True,
-                include_links=False,
-                favor_precision=True,
-                favor_recall=True,
-            )
-            or {}
+        # Trafilatura 2.2 returns a Document object by default.
+        # Convert it explicitly before accessing fields.
+        doc = trafilatura.bare_extraction(
+            html,
+            url=url,
+            include_comments=False,
+            include_tables=True,
+            include_links=False,
+            favor_precision=True,
+            favor_recall=True,
+            with_metadata=True,
         )
+        if doc is not None:
+            if hasattr(doc, "as_dict"):
+                data = doc.as_dict() or {}
+            elif isinstance(doc, dict):
+                data = doc
+            else:
+                data = {
+                    "text": getattr(doc, "text", "") or "",
+                    "title": getattr(doc, "title", "") or "",
+                    "author": getattr(doc, "author", "") or "",
+                    "date": getattr(doc, "date", "") or "",
+                    "image": getattr(doc, "image", "") or "",
+                }
     except Exception:
-        pass
+        data = {}
+
+    # Plain-text Trafilatura fallback.
+    if not data.get("text"):
+        try:
+            plain = trafilatura.extract(
+                html, url=url, include_comments=False,
+                include_tables=True, include_links=False,
+                favor_precision=False, favor_recall=True,
+                output_format="txt"
+            )
+            if plain:
+                data["text"] = plain
+        except Exception:
+            pass
 
     text = clean(data.get("text", ""))
     title = clean(data.get("title", "")) or meta["title"]
@@ -241,6 +268,34 @@ def extract_article(html: str, url: str, method: str) -> dict:
     if isinstance(body, str) and len(body) > len(text):
         text = clean(body)
         method += "+jsonld"
+
+    # Common publisher DOM fallback when structured extraction is short.
+    if len(text.split()) < 120:
+        try:
+            soup = BeautifulSoup(html, "lxml")
+            candidates = []
+            selectors = (
+                "article", "main", "[role='main']",
+                "[itemprop='articleBody']", ".article-body",
+                ".article-content", ".story-body", ".story-content",
+                ".entry-content", ".post-content", ".article__body"
+            )
+            for selector in selectors:
+                for node in soup.select(selector):
+                    parts = []
+                    for p in node.find_all(["p", "h2", "h3"]):
+                        t = clean(p.get_text(" ", strip=True))
+                        if 45 <= len(t) <= 3000:
+                            parts.append(t)
+                    if parts:
+                        candidates.append("\n".join(parts))
+            if candidates:
+                dom_text = max(candidates, key=len)
+                if len(dom_text) > len(text):
+                    text = dom_text
+                    method += "+dom"
+        except Exception:
+            pass
 
     paragraphs = []
     seen = set()
