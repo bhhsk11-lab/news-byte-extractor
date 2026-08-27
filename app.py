@@ -12,7 +12,6 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
-from playwright.async_api import async_playwright
 
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
@@ -43,7 +42,7 @@ MIN_GOOD_SCORE = 0.30
 
 class ExtractRequest(BaseModel):
     url: HttpUrl
-    render: bool = True
+    render: bool = False
     max_chars: int = 60000
 
 
@@ -329,40 +328,27 @@ async def fetch_html(url: str):
 
 
 async def fetch_rendered(url: str):
+    """Optional browser fallback; Playwright is not installed in the free build."""
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise RuntimeError("Playwright is not installed in this lightweight deployment") from exc
+
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
-
         page = await browser.new_page(
             user_agent=USER_AGENT,
             viewport={"width": 1440, "height": 1800},
         )
-
         try:
-            await page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=30000,
-            )
-
-            # Allow client-side article content and lazy loading to appear.
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(1500)
-
-            await page.evaluate(
-                "window.scrollTo(0, document.body.scrollHeight * 0.70)"
-            )
-
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.70)")
             await page.wait_for_timeout(900)
-
-            html = await page.content()
-            return html, page.url
-
+            return await page.content(), page.url
         finally:
             await browser.close()
 
