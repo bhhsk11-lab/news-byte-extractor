@@ -4,7 +4,7 @@ import json
 import re
 import socket
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import httpx
 import trafilatura
@@ -13,14 +13,14 @@ try:
 except Exception:
     gnewsdecoder = None
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
     description="Non-AI source article extraction service for NEWS BYTE.",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 # NEWS BYTE is a personal extension. CORS is open so the extension can call
@@ -221,11 +221,68 @@ def extract_metadata(html: str, url: str) -> dict:
         )
     )
 
-    image = meta(
+    def image_candidate(value):
+        if isinstance(value, str):
+            value = value.strip()
+            if value.startswith("//"):
+                value = "https:" + value
+            if re.match(r"^https?://", value, re.I) and "news.google.com" not in value.lower():
+                return urljoin(url, value)
+        elif isinstance(value, dict):
+            for k in ("url", "contentUrl", "thumbnailUrl"):
+                got = image_candidate(value.get(k))
+                if got:
+                    return got
+        elif isinstance(value, list):
+            for item in value:
+                got = image_candidate(item)
+                if got:
+                    return got
+        return ""
+
+    image = image_candidate(jsonld.get("image")) or meta(
         ("property", "og:image"),
+        ("property", "og:image:url"),
+        ("property", "og:image:secure_url"),
+        ("name", "og:image"),
         ("name", "twitter:image"),
         ("name", "twitter:image:src"),
     )
+    image = image_candidate(image)
+
+    # More publisher variants: <link rel=image_src>, lazy-loaded image attrs,
+    # and srcset. Prefer a reasonably large article image over tiny icons.
+    if not image:
+        link_img = soup.find("link", attrs={"rel": re.compile(r"(^|\\s)image_src(\\s|$)", re.I)})
+        image = image_candidate(link_img.get("href", "")) if link_img else ""
+    if not image:
+        imgs = []
+        for tag in soup.find_all("img"):
+            classes = " ".join(tag.get("class", []))
+            marker = " ".join([
+                str(tag.get("alt", "")), classes, str(tag.get("id", "")),
+                str(tag.get("data-testid", ""))
+            ]).lower()
+            if any(x in marker for x in ("logo", "avatar", "icon", "author", "profile", "social")):
+                continue
+            candidates = [
+                tag.get("src"), tag.get("data-src"), tag.get("data-original"),
+                tag.get("data-lazy-src"), tag.get("data-image"), tag.get("data-url")
+            ]
+            srcset = tag.get("srcset") or tag.get("data-srcset")
+            if srcset:
+                # Usually the final/largest candidate is the best one.
+                candidates.append(srcset.split(",")[-1].strip().split(" ")[0])
+            for c in candidates:
+                got = image_candidate(c)
+                if got:
+                    imgs.append(got)
+                    break
+        if imgs:
+            image = imgs[0]
+
+    if image and "news.google.com" in image.lower():
+        image = ""
 
     author = ""
     author_data = jsonld.get("author", "")
@@ -466,6 +523,7 @@ async def extract_one(url: str, render: bool, max_chars: int):
 
     errors = []
     requested_url = url
+    last_result = None
 
     # Google News RSS gives encoded /rss/articles/ URLs. They usually return a
     # Google interstitial to plain HTTP clients, so resolve them first.
@@ -486,7 +544,7 @@ async def extract_one(url: str, render: bool, max_chars: int):
         result["requested_url"] = requested_url
         result["resolved_url"] = final_url
         result["google_resolve"] = resolve_method
-
+        last_result = result
 
         if (
             result["word_count"] >= MIN_GOOD_WORDS
@@ -516,6 +574,13 @@ async def extract_one(url: str, render: bool, max_chars: int):
         except Exception as exc:
             errors.append("render:" + type(exc).__name__)
 
+    if last_result and last_result.get("image"):
+        last_result["ok"] = False
+        last_result["method"] = last_result.get("method", "failed") + "+low-quality"
+        last_result["errors"] = errors
+        last_result["text"] = last_result.get("text", "")[:max_chars]
+        return last_result
+
     return {
         "ok": False,
         "url": requested_url,
@@ -537,11 +602,43 @@ async def extract_one(url: str, render: bool, max_chars: int):
     }
 
 
+@app.get("/image")
+async def proxy_image(url: str):
+    """Fetch a publisher image server-side so hotlink/referrer blocking is less likely to blank cards."""
+    if not is_public_url(url):
+        raise HTTPException(status_code=400, detail="Only public HTTP/HTTPS image URLs are allowed.")
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": url,
+    }
+    try:
+        timeout = httpx.Timeout(15.0, connect=8.0)
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, max_redirects=5, timeout=timeout) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            ctype = (r.headers.get("content-type") or "").split(";", 1)[0].lower()
+            if not ctype.startswith("image/"):
+                raise HTTPException(status_code=415, detail="URL did not return an image")
+            if len(r.content) > 8_000_000:
+                raise HTTPException(status_code=413, detail="Image is too large")
+            return Response(
+                content=r.content,
+                media_type=ctype,
+                headers={"Cache-Control": "public, max-age=86400, stale-while-revalidate=604800"},
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Image fetch failed: {type(exc).__name__}") from exc
+
+
 @app.get("/")
 async def root():
     return {
         "service": "NEWS BYTE Source Extractor",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "ai": False,
         "usage": "POST /extract with {url, render, max_chars}",
     }
