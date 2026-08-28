@@ -5,7 +5,6 @@ import re
 import socket
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
-import time
 
 import httpx
 import trafilatura
@@ -34,15 +33,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/149.0.0.0 Safari/537.36 NEWS-BYTE/1.0"
-)
+
+@app.on_event("shutdown")
+async def _close_http_client():
+    if HTTP_CLIENT is not None and not HTTP_CLIENT.is_closed:
+        await HTTP_CLIENT.aclose()
+
+# A single hard-coded UA with a custom "NEWS-BYTE/1.0" token is a trivial
+# fingerprint: it's unique to this scraper, it's the exact same string on
+# every request, and it doesn't match any real browser network's TLS/HTTP2
+# signature. Sites that hard-block scrapers (zeenews.india.com,
+# hospitalitybizindia.com in testing) do it on exactly this kind of signal.
+# Use a small pool of current, ordinary desktop-browser UA strings and pick
+# one per request/host so requests look like normal traffic and repeated
+# hits on the same domain don't all present an identical fingerprint.
+BROWSER_PROFILES = [
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+        "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-mobile": "?0",
+    },
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+            "(KHTML, like Gecko) Version/17.5 Safari/605.1.15"
+        ),
+        "sec-ch-ua": '"Not.A/Brand";v="8", "Chromium";v="127"',
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-ch-ua-mobile": "?0",
+    },
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0"
+        ),
+        "sec-ch-ua": '"Microsoft Edge";v="127", "Not;A=Brand";v="24", "Chromium";v="127"',
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-mobile": "?0",
+    },
+]
+
+# A well-behaved, clearly-labelled crawler UA. Some publishers 403 an
+# anonymous "browser" UA on the very first hit from a datacenter IP but do
+# allow known search-engine crawlers through (they need the SEO traffic).
+# Used only as a last-resort retry, never as the first attempt.
+CRAWLER_FALLBACK_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 
 MAX_DOWNLOAD_BYTES = 8_000_000
 MIN_GOOD_WORDS = 120
 MIN_GOOD_SCORE = 0.30
+FETCH_RETRY_STATUSES = {403, 429, 503}
+PER_HOST_CONCURRENCY = 3
 
 # Google News RSS article links are encoded Google redirect URLs, not publisher
 # article URLs. Keep a small in-process cache to avoid resolving the same link
@@ -51,38 +96,70 @@ GOOGLE_RESOLVE_CACHE = {}
 GOOGLE_RESOLVE_LOCK = asyncio.Lock()
 GOOGLE_RESOLVE_CACHE_MAX = 500
 
-# Reuse HTTP connections across concurrent article requests. This is much
-# faster than creating a new TLS connection for every article.
-HTTP_CLIENT = None
-EXTRACTION_CACHE = {}
-EXTRACTION_CACHE_TTL = 600  # 10 minutes
-EXTRACTION_CACHE_MAX = 300
-EXTRACTION_INFLIGHT = {}
-EXTRACTION_SEMAPHORE = asyncio.Semaphore(8)
+# One shared, connection-pooled client instead of opening/closing a fresh
+# TLS connection per article. This is the single biggest speed win when the
+# extension crawls a domain (dozens of /extract calls back-to-back): keeps
+# TCP/TLS handshakes warm to hosts that get hit repeatedly.
+HTTP_CLIENT: "httpx.AsyncClient | None" = None
+
+# Hammering one host with 10 concurrent requests (a full-domain crawl) is
+# exactly the pattern that trips basic rate limiting. Cap concurrency per
+# host while leaving cross-host requests fully parallel.
+_HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
+_HOST_SEMAPHORES_LOCK = asyncio.Lock()
 
 
-@app.on_event("startup")
-async def startup_http_client():
+async def get_http_client() -> httpx.AsyncClient:
     global HTTP_CLIENT
-    HTTP_CLIENT = httpx.AsyncClient(
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-        follow_redirects=True,
-        max_redirects=5,
-        timeout=httpx.Timeout(18.0, connect=8.0),
-        limits=httpx.Limits(max_connections=12, max_keepalive_connections=8, keepalive_expiry=30.0),
-    )
+    if HTTP_CLIENT is None or HTTP_CLIENT.is_closed:
+        HTTP_CLIENT = httpx.AsyncClient(
+            follow_redirects=True,
+            max_redirects=5,
+            timeout=httpx.Timeout(20.0, connect=10.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+            http2=True,
+        )
+    return HTTP_CLIENT
 
 
-@app.on_event("shutdown")
-async def shutdown_http_client():
-    global HTTP_CLIENT
-    if HTTP_CLIENT is not None:
-        await HTTP_CLIENT.aclose()
-        HTTP_CLIENT = None
+async def get_host_semaphore(host: str) -> asyncio.Semaphore:
+    async with _HOST_SEMAPHORES_LOCK:
+        sem = _HOST_SEMAPHORES.get(host)
+        if sem is None:
+            sem = asyncio.Semaphore(PER_HOST_CONCURRENCY)
+            _HOST_SEMAPHORES[host] = sem
+        return sem
+
+
+def pick_browser_profile(url: str) -> dict:
+    """Deterministic-but-varied UA choice: same host tends to get the same
+    profile within a run (consistent fingerprint per session), different
+    hosts get spread across the pool."""
+    host = urlparse(url).hostname or ""
+    return BROWSER_PROFILES[hash(host) % len(BROWSER_PROFILES)]
+
+
+def browser_headers(url: str, profile: dict | None = None) -> dict:
+    profile = profile or pick_browser_profile(url)
+    origin = f"{urlparse(url).scheme}://{urlparse(url).hostname}"
+    return {
+        "User-Agent": profile["User-Agent"],
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;"
+            "q=0.9,image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": origin + "/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "sec-ch-ua": profile.get("sec-ch-ua", ""),
+        "sec-ch-ua-platform": profile.get("sec-ch-ua-platform", ""),
+        "sec-ch-ua-mobile": profile.get("sec-ch-ua-mobile", "?0"),
+    }
 
 
 def is_google_news_article_url(url: str) -> bool:
@@ -161,6 +238,104 @@ def is_public_url(url: str) -> bool:
 
 def clean(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
+
+
+# Lines that are common publisher chrome/boilerplate rather than article
+# content: share/follow prompts, app-download nags, cookie/legal notices,
+# "Also Read" cross-promo links, live-blog labels, etc. These regularly slip
+# through a plain paragraph split and make extracted "news" read like a page
+# full of ads and navigation instead of the story itself.
+_BOILERPLATE_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"^(also|must)\s+(read|watch|see)\b",
+        r"\bclick here\b",
+        r"^read more\b",
+        r"\bfollow (us|npr|ndtv)?\s*on\s+(twitter|facebook|instagram|whatsapp|telegram|x)\b",
+        r"\bdownload (the|our)\s+app\b",
+        r"\bsubscribe to\b.*(newsletter|channel|premium)",
+        r"\bsign up for\b.*newsletter",
+        r"\bwhatsapp channel\b",
+        r"^advertisement$",
+        r"^sponsored\b",
+        r"\ball rights reserved\b",
+        r"^copyright\s*(©|\(c\))",
+        r"\bterms (of|and)\s*(use|service|conditions)\b",
+        r"\bprivacy policy\b",
+        r"\bcookie(s)?\s+policy\b",
+        r"\bwe use cookies\b",
+        r"^disclaimer\s*:",
+        r"\bviews (expressed|are personal)\b",
+        r"^catch all the\b",
+        r"^stay updated with\b",
+        r"this (story|article)\s+(has not been edited|is auto-generated)",
+        r"^share (this|via|on)\b",
+        r"^(photo gallery|view all images|in pictures)\b",
+        r"^trending (news|now|stories)\b",
+        r"^(watch|must watch)\s*[:\-]",
+        r"^loading\.{2,3}$",
+        r"\benable javascript\b",
+        r"^\(?(reuters|ap|pti|ani|afp)\)?\s*[-—]\s*$",
+        r"^\d+\s+(shares?|comments?|min read)$",
+        r"^tags?\s*:",
+        r"^published\s*:",
+        r"^updated\s*:",
+        r"^image\s*(credit|source)\s*:",
+        r"^(related|recommended|more)\s+(stories|articles|news|posts|reads)\b",
+        r"^you\s+(may|might)\s+(also\s+)?like\b",
+        r"^more from\b",
+        r"^editor'?s?\s+pick(s)?\b",
+        r"^trending\s+now\b",
+        r"^(sign in|log in|register)\s+to\b",
+        r"^create (a free )?account\b",
+        r"^comments?\s*\(\d+\)$",
+        r"^leave a (comment|reply)\b",
+        r"^\d+\s+(min(ute)?s?)\s+(read|ago)$",
+        r"^for more (news|updates)\b",
+    )
+]
+
+
+def is_boilerplate(paragraph: str) -> bool:
+    """True for lines that are page chrome rather than article prose."""
+    text_l = paragraph.strip()
+    if not text_l:
+        return True
+    if len(text_l) <= 60 and text_l.isupper():
+        # Short all-caps lines are almost always section/nav labels.
+        return True
+    return any(p.search(text_l) for p in _BOILERPLATE_PATTERNS)
+
+
+def clean_title(title: str, url: str) -> str:
+    """Strip a trailing ' | Publisher Name' / ' - Publisher Name' suffix.
+
+    Only strips when the trailing segment is short and either matches the
+    page's own domain or is short enough to plausibly be a site name, so a
+    real subtitle (e.g. "Budget 2026: What changes for you - explained")
+    is left alone.
+    """
+    if not title:
+        return title
+    try:
+        domain = (urlparse(url).hostname or "").lower()
+        domain_core = re.sub(r"^www\.", "", domain).split(".")[0]
+    except Exception:
+        domain_core = ""
+    for sep in (" | ", " — ", " – ", " - "):
+        if sep in title:
+            head, _, tail = title.rpartition(sep)
+            head, tail = head.strip(), tail.strip()
+            if not head or not tail:
+                continue
+            tail_key = re.sub(r"[^a-z0-9]", "", tail.lower())
+            looks_like_site_name = len(tail.split()) <= 5 and (
+                (domain_core and len(domain_core) >= 3 and domain_core in tail_key)
+                or len(tail_key) <= 24
+            )
+            if looks_like_site_name:
+                return head
+    return title
 
 
 def parse_jsonld(html: str) -> dict:
@@ -439,6 +614,7 @@ def extract_article(html: str, url: str, method: str) -> dict:
 
     paragraphs = []
     seen = set()
+    junk_dropped = 0
 
     raw_text = data.get("text", "") or text
 
@@ -446,6 +622,10 @@ def extract_article(html: str, url: str, method: str) -> dict:
         paragraph = clean(raw)
 
         if len(paragraph) < 40:
+            continue
+
+        if is_boilerplate(paragraph):
+            junk_dropped += 1
             continue
 
         key = re.sub(r"[^a-z0-9]+", " ", paragraph.lower()).strip()
@@ -456,13 +636,26 @@ def extract_article(html: str, url: str, method: str) -> dict:
         seen.add(key)
         paragraphs.append(paragraph)
 
+    # Rebuild the plain-text body from the cleaned, deduplicated,
+    # boilerplate-free paragraphs instead of returning the raw blob. Anything
+    # that reads `text` (rather than `paragraphs`) then gets the same "proper
+    # news" content, not leftover nav/ad/share-prompt lines that slipped past
+    # the paragraph split.
+    text = "\n\n".join(paragraphs) if paragraphs else text
+    title = clean_title(title, url)
+
     words = len(text.split())
 
     # A practical quality score for deciding whether to use the fast result
-    # or spend time rendering the page.
+    # or spend time rendering the page. A page that was mostly boilerplate
+    # (lots of dropped junk lines relative to kept paragraphs) is penalized,
+    # since that's a signal the real article body wasn't cleanly isolated.
     word_score = min(1.0, words / 900)
     paragraph_score = min(1.0, len(paragraphs) / 10)
-    quality = 0.65 * word_score + 0.35 * paragraph_score
+    junk_ratio = junk_dropped / max(1, junk_dropped + len(paragraphs))
+    quality = max(0.0, (0.65 * word_score + 0.35 * paragraph_score) - 0.4 * junk_ratio)
+
+    description = meta["description"] or (paragraphs[0][:280] if paragraphs else "")
 
     return {
         "ok": bool(text),
@@ -471,7 +664,7 @@ def extract_article(html: str, url: str, method: str) -> dict:
         "author": author,
         "published": published,
         "image": image,
-        "description": meta["description"],
+        "description": description,
         "text": text,
         "paragraphs": paragraphs,
         "word_count": words,
@@ -481,12 +674,15 @@ def extract_article(html: str, url: str, method: str) -> dict:
     }
 
 
-async def fetch_html(url: str):
-    client = HTTP_CLIENT
-    if client is None:
-        raise RuntimeError("HTTP client is not ready")
+async def _do_fetch(client: httpx.AsyncClient, url: str, headers: dict):
+    async with client.stream("GET", url, headers=headers) as response:
+        status = response.status_code
+        if status in FETCH_RETRY_STATUSES:
+            # Drain quickly and let the caller decide whether to retry;
+            # raising here (via raise_for_status) would also work but we
+            # want the status code available without re-parsing the exception.
+            response.raise_for_status()
 
-    async with client.stream("GET", url) as response:
         response.raise_for_status()
 
         content_type = response.headers.get("content-type", "").lower()
@@ -498,12 +694,58 @@ async def fetch_html(url: str):
 
         async for chunk in response.aiter_bytes():
             total += len(chunk)
+
             if total > MAX_DOWNLOAD_BYTES:
                 raise ValueError("Source HTML is too large")
+
             chunks.append(chunk)
 
         html = b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
+
         return html, str(response.url)
+
+
+async def fetch_html(url: str):
+    """Fetch a page's HTML with a realistic header profile, bounded per-host
+    concurrency, and one bounded retry for soft blocks (403/429/503).
+
+    A 403/429/503 is very often not "this content doesn't exist" but "this
+    specific request looked like a bot" — a stale/identifying UA, an
+    overly-aggressive burst of concurrent requests to the same host, or a
+    missing Referer. Retrying once, after backing off and swapping to a
+    crawler-labelled UA, recovers a meaningful share of those without
+    needing a full browser render.
+    """
+    client = await get_http_client()
+    host = urlparse(url).hostname or ""
+    semaphore = await get_host_semaphore(host)
+
+    last_exc = None
+    async with semaphore:
+        for attempt in range(2):
+            if attempt == 0:
+                headers = browser_headers(url)
+            else:
+                await asyncio.sleep(0.6 + 0.4 * attempt)
+                headers = browser_headers(url)
+                headers["User-Agent"] = CRAWLER_FALLBACK_UA
+                headers.pop("sec-ch-ua", None)
+                headers.pop("sec-ch-ua-platform", None)
+                headers.pop("sec-ch-ua-mobile", None)
+
+            try:
+                return await _do_fetch(client, url, headers)
+            except httpx.HTTPStatusError as exc:
+                last_exc = exc
+                if exc.response.status_code not in FETCH_RETRY_STATUSES:
+                    raise
+                # Loop again with the fallback profile.
+                continue
+            except httpx.RequestError as exc:
+                last_exc = exc
+                raise
+
+        raise last_exc
 
 
 async def fetch_rendered(url: str):
@@ -519,7 +761,7 @@ async def fetch_rendered(url: str):
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
         page = await browser.new_page(
-            user_agent=USER_AGENT,
+            user_agent=pick_browser_profile(url)["User-Agent"],
             viewport={"width": 1440, "height": 1800},
         )
         try:
@@ -534,38 +776,13 @@ async def fetch_rendered(url: str):
 
 async def extract_one(url: str, render: bool, max_chars: int):
     if not is_public_url(url):
-        raise HTTPException(status_code=400, detail="Only public HTTP/HTTPS URLs are allowed.")
+        raise HTTPException(
+            status_code=400,
+            detail="Only public HTTP/HTTPS URLs are allowed.",
+        )
 
-    cache_key = str(url).split("#", 1)[0]
-    cached = EXTRACTION_CACHE.get(cache_key)
-    if cached and (time.monotonic() - cached[0]) < EXTRACTION_CACHE_TTL:
-        result = dict(cached[1])
-        result["cache"] = True
-        return result
-
-    existing = EXTRACTION_INFLIGHT.get(cache_key)
-    if existing is not None:
-        return dict(await existing)
-
-    async def runner():
-        async with EXTRACTION_SEMAPHORE:
-            return await _extract_one_uncached(url, render, max_chars, url)
-
-    task = asyncio.create_task(runner())
-    EXTRACTION_INFLIGHT[cache_key] = task
-    try:
-        result = await task
-        if result.get("ok") or result.get("image"):
-            if len(EXTRACTION_CACHE) >= EXTRACTION_CACHE_MAX:
-                EXTRACTION_CACHE.pop(next(iter(EXTRACTION_CACHE)))
-            EXTRACTION_CACHE[cache_key] = (time.monotonic(), dict(result))
-        return result
-    finally:
-        EXTRACTION_INFLIGHT.pop(cache_key, None)
-
-
-async def _extract_one_uncached(url: str, render: bool, max_chars: int, requested_url: str):
     errors = []
+    requested_url = url
     last_result = None
 
     # Google News RSS gives encoded /rss/articles/ URLs. They usually return a
@@ -596,6 +813,11 @@ async def _extract_one_uncached(url: str, render: bool, max_chars: int, requeste
             result["text"] = result["text"][:max_chars]
             return result
 
+    except httpx.HTTPStatusError as exc:
+        # Record the actual status (e.g. "http:403") instead of the generic
+        # exception class name, so blocked-vs-broken is visible in the logs
+        # the extension surfaces to the user.
+        errors.append(f"http:{exc.response.status_code}")
     except Exception as exc:
         errors.append("http:" + type(exc).__name__)
 
@@ -651,15 +873,13 @@ async def proxy_image(url: str):
     if not is_public_url(url):
         raise HTTPException(status_code=400, detail="Only public HTTP/HTTPS image URLs are allowed.")
     headers = {
-        "User-Agent": USER_AGENT,
+        "User-Agent": pick_browser_profile(url)["User-Agent"],
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": url,
     }
     try:
-        client = HTTP_CLIENT
-        if client is None:
-            raise RuntimeError("HTTP client is not ready")
+        client = await get_http_client()
         r = await client.get(url, headers=headers, timeout=httpx.Timeout(15.0, connect=8.0))
         r.raise_for_status()
         ctype = (r.headers.get("content-type") or "").split(";", 1)[0].lower()
