@@ -19,7 +19,7 @@ from pydantic import BaseModel, HttpUrl
 
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
-    description="Non-AI source article extraction service for NEWS BYTE.",
+    description="Non-AI source article + site-structure extraction service for NEWS BYTE.",
     version="1.4.0",
 )
 
@@ -33,61 +33,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@app.on_event("shutdown")
-async def _close_http_client():
-    if HTTP_CLIENT is not None and not HTTP_CLIENT.is_closed:
-        await HTTP_CLIENT.aclose()
-
-# A single hard-coded UA with a custom "NEWS-BYTE/1.0" token is a trivial
-# fingerprint: it's unique to this scraper, it's the exact same string on
-# every request, and it doesn't match any real browser network's TLS/HTTP2
-# signature. Sites that hard-block scrapers (zeenews.india.com,
-# hospitalitybizindia.com in testing) do it on exactly this kind of signal.
-# Use a small pool of current, ordinary desktop-browser UA strings and pick
-# one per request/host so requests look like normal traffic and repeated
-# hits on the same domain don't all present an identical fingerprint.
-BROWSER_PROFILES = [
-    {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        ),
-        "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-ch-ua-mobile": "?0",
-    },
-    {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-            "(KHTML, like Gecko) Version/17.5 Safari/605.1.15"
-        ),
-        "sec-ch-ua": '"Not.A/Brand";v="8", "Chromium";v="127"',
-        "sec-ch-ua-platform": '"macOS"',
-        "sec-ch-ua-mobile": "?0",
-    },
-    {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0"
-        ),
-        "sec-ch-ua": '"Microsoft Edge";v="127", "Not;A=Brand";v="24", "Chromium";v="127"',
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-ch-ua-mobile": "?0",
-    },
-]
-
-# A well-behaved, clearly-labelled crawler UA. Some publishers 403 an
-# anonymous "browser" UA on the very first hit from a datacenter IP but do
-# allow known search-engine crawlers through (they need the SEO traffic).
-# Used only as a last-resort retry, never as the first attempt.
-CRAWLER_FALLBACK_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/149.0.0.0 Safari/537.36 NEWS-BYTE/1.0"
+)
 
 MAX_DOWNLOAD_BYTES = 8_000_000
 MIN_GOOD_WORDS = 120
 MIN_GOOD_SCORE = 0.30
-FETCH_RETRY_STATUSES = {403, 429, 503}
-PER_HOST_CONCURRENCY = 3
 
 # Google News RSS article links are encoded Google redirect URLs, not publisher
 # article URLs. Keep a small in-process cache to avoid resolving the same link
@@ -95,71 +49,6 @@ PER_HOST_CONCURRENCY = 3
 GOOGLE_RESOLVE_CACHE = {}
 GOOGLE_RESOLVE_LOCK = asyncio.Lock()
 GOOGLE_RESOLVE_CACHE_MAX = 500
-
-# One shared, connection-pooled client instead of opening/closing a fresh
-# TLS connection per article. This is the single biggest speed win when the
-# extension crawls a domain (dozens of /extract calls back-to-back): keeps
-# TCP/TLS handshakes warm to hosts that get hit repeatedly.
-HTTP_CLIENT: "httpx.AsyncClient | None" = None
-
-# Hammering one host with 10 concurrent requests (a full-domain crawl) is
-# exactly the pattern that trips basic rate limiting. Cap concurrency per
-# host while leaving cross-host requests fully parallel.
-_HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
-_HOST_SEMAPHORES_LOCK = asyncio.Lock()
-
-
-async def get_http_client() -> httpx.AsyncClient:
-    global HTTP_CLIENT
-    if HTTP_CLIENT is None or HTTP_CLIENT.is_closed:
-        HTTP_CLIENT = httpx.AsyncClient(
-            follow_redirects=True,
-            max_redirects=5,
-            timeout=httpx.Timeout(20.0, connect=10.0),
-            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
-            http2=True,
-        )
-    return HTTP_CLIENT
-
-
-async def get_host_semaphore(host: str) -> asyncio.Semaphore:
-    async with _HOST_SEMAPHORES_LOCK:
-        sem = _HOST_SEMAPHORES.get(host)
-        if sem is None:
-            sem = asyncio.Semaphore(PER_HOST_CONCURRENCY)
-            _HOST_SEMAPHORES[host] = sem
-        return sem
-
-
-def pick_browser_profile(url: str) -> dict:
-    """Deterministic-but-varied UA choice: same host tends to get the same
-    profile within a run (consistent fingerprint per session), different
-    hosts get spread across the pool."""
-    host = urlparse(url).hostname or ""
-    return BROWSER_PROFILES[hash(host) % len(BROWSER_PROFILES)]
-
-
-def browser_headers(url: str, profile: dict | None = None) -> dict:
-    profile = profile or pick_browser_profile(url)
-    origin = f"{urlparse(url).scheme}://{urlparse(url).hostname}"
-    return {
-        "User-Agent": profile["User-Agent"],
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": origin + "/",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        "sec-ch-ua": profile.get("sec-ch-ua", ""),
-        "sec-ch-ua-platform": profile.get("sec-ch-ua-platform", ""),
-        "sec-ch-ua-mobile": profile.get("sec-ch-ua-mobile", "?0"),
-    }
 
 
 def is_google_news_article_url(url: str) -> bool:
@@ -204,6 +93,13 @@ class ExtractRequest(BaseModel):
     url: HttpUrl
     render: bool = False
     max_chars: int = 60000
+
+
+class ExploreRequest(BaseModel):
+    url: HttpUrl
+    max_pages: int = 24
+    max_depth: int = 1
+    concurrency: int = 8
 
 
 def is_public_url(url: str) -> bool:
@@ -281,17 +177,6 @@ _BOILERPLATE_PATTERNS = [
         r"^published\s*:",
         r"^updated\s*:",
         r"^image\s*(credit|source)\s*:",
-        r"^(related|recommended|more)\s+(stories|articles|news|posts|reads)\b",
-        r"^you\s+(may|might)\s+(also\s+)?like\b",
-        r"^more from\b",
-        r"^editor'?s?\s+pick(s)?\b",
-        r"^trending\s+now\b",
-        r"^(sign in|log in|register)\s+to\b",
-        r"^create (a free )?account\b",
-        r"^comments?\s*\(\d+\)$",
-        r"^leave a (comment|reply)\b",
-        r"^\d+\s+(min(ute)?s?)\s+(read|ago)$",
-        r"^for more (news|updates)\b",
     )
 ]
 
@@ -433,10 +318,16 @@ def extract_metadata(html: str, url: str) -> dict:
     def image_candidate(value):
         if isinstance(value, str):
             value = value.strip()
+            if not value:
+                return ""
             if value.startswith("//"):
                 value = "https:" + value
-            if re.match(r"^https?://", value, re.I) and "news.google.com" not in value.lower():
-                return urljoin(url, value)
+            # Resolve relative to the page URL first (govt/coaching sites often
+            # publish og:image as a root-relative path like "/img/hero.jpg"),
+            # then apply the same absolute-URL + Google-News filtering as before.
+            resolved = urljoin(url, value)
+            if re.match(r"^https?://", resolved, re.I) and "news.google.com" not in resolved.lower():
+                return resolved
         elif isinstance(value, dict):
             for k in ("url", "contentUrl", "thumbnailUrl"):
                 got = image_candidate(value.get(k))
@@ -674,78 +565,45 @@ def extract_article(html: str, url: str, method: str) -> dict:
     }
 
 
-async def _do_fetch(client: httpx.AsyncClient, url: str, headers: dict):
-    async with client.stream("GET", url, headers=headers) as response:
-        status = response.status_code
-        if status in FETCH_RETRY_STATUSES:
-            # Drain quickly and let the caller decide whether to retry;
-            # raising here (via raise_for_status) would also work but we
-            # want the status code available without re-parsing the exception.
+async def fetch_html(url: str):
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;"
+            "q=0.9,image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    timeout = httpx.Timeout(20.0, connect=10.0)
+
+    async with httpx.AsyncClient(
+        headers=headers,
+        follow_redirects=True,
+        max_redirects=5,
+        timeout=timeout,
+    ) as client:
+        async with client.stream("GET", url) as response:
             response.raise_for_status()
 
-        response.raise_for_status()
+            content_type = response.headers.get("content-type", "").lower()
+            if "html" not in content_type and "xml" not in content_type:
+                raise ValueError("Source response is not HTML")
 
-        content_type = response.headers.get("content-type", "").lower()
-        if "html" not in content_type and "xml" not in content_type:
-            raise ValueError("Source response is not HTML")
+            chunks = []
+            total = 0
 
-        chunks = []
-        total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
 
-        async for chunk in response.aiter_bytes():
-            total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    raise ValueError("Source HTML is too large")
 
-            if total > MAX_DOWNLOAD_BYTES:
-                raise ValueError("Source HTML is too large")
+                chunks.append(chunk)
 
-            chunks.append(chunk)
+            html = b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
 
-        html = b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
-
-        return html, str(response.url)
-
-
-async def fetch_html(url: str):
-    """Fetch a page's HTML with a realistic header profile, bounded per-host
-    concurrency, and one bounded retry for soft blocks (403/429/503).
-
-    A 403/429/503 is very often not "this content doesn't exist" but "this
-    specific request looked like a bot" — a stale/identifying UA, an
-    overly-aggressive burst of concurrent requests to the same host, or a
-    missing Referer. Retrying once, after backing off and swapping to a
-    crawler-labelled UA, recovers a meaningful share of those without
-    needing a full browser render.
-    """
-    client = await get_http_client()
-    host = urlparse(url).hostname or ""
-    semaphore = await get_host_semaphore(host)
-
-    last_exc = None
-    async with semaphore:
-        for attempt in range(2):
-            if attempt == 0:
-                headers = browser_headers(url)
-            else:
-                await asyncio.sleep(0.6 + 0.4 * attempt)
-                headers = browser_headers(url)
-                headers["User-Agent"] = CRAWLER_FALLBACK_UA
-                headers.pop("sec-ch-ua", None)
-                headers.pop("sec-ch-ua-platform", None)
-                headers.pop("sec-ch-ua-mobile", None)
-
-            try:
-                return await _do_fetch(client, url, headers)
-            except httpx.HTTPStatusError as exc:
-                last_exc = exc
-                if exc.response.status_code not in FETCH_RETRY_STATUSES:
-                    raise
-                # Loop again with the fallback profile.
-                continue
-            except httpx.RequestError as exc:
-                last_exc = exc
-                raise
-
-        raise last_exc
+            return html, str(response.url)
 
 
 async def fetch_rendered(url: str):
@@ -761,7 +619,7 @@ async def fetch_rendered(url: str):
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
         page = await browser.new_page(
-            user_agent=pick_browser_profile(url)["User-Agent"],
+            user_agent=USER_AGENT,
             viewport={"width": 1440, "height": 1800},
         )
         try:
@@ -813,11 +671,6 @@ async def extract_one(url: str, render: bool, max_chars: int):
             result["text"] = result["text"][:max_chars]
             return result
 
-    except httpx.HTTPStatusError as exc:
-        # Record the actual status (e.g. "http:403") instead of the generic
-        # exception class name, so blocked-vs-broken is visible in the logs
-        # the extension surfaces to the user.
-        errors.append(f"http:{exc.response.status_code}")
     except Exception as exc:
         errors.append("http:" + type(exc).__name__)
 
@@ -867,31 +720,332 @@ async def extract_one(url: str, render: bool, max_chars: int):
     }
 
 
+# ---------------------------------------------------------------------------
+# Explore / Coaching: deep structured extraction + same-domain crawl.
+#
+# This is a server-side port of the extension's old client-side
+# pageStructuredExtractor()/crawlSite() (background.js). Moving it here means
+# the extension never has to open a background tab or juggle a dozen
+# concurrent fetches through an offscreen document to "explore" a site (govt
+# sites, coaching sites, anything) — it just POSTs a URL and gets back a
+# heading -> paragraphs/bullets section tree plus classified same-domain
+# links (PDFs, books, magazines, pagination, tags, categories) and media.
+# ---------------------------------------------------------------------------
+
+_BAD_RX = re.compile(
+    r"(^|[-_ ])(ad|ads|advert|advertisement|banner|cookie|consent|subscribe|newsletter|"
+    r"nav|navbar|menu|footer|header|sidebar|related|recommended|comments?|social|share|"
+    r"promo|modal|popup|paywall|login|register|breadcrumb|utility|toolbar|app-promo|"
+    r"download-app)([-_ ]|$)",
+    re.I,
+)
+
+
+def _cls_id(tag) -> str:
+    try:
+        classes = " ".join(tag.get("class") or [])
+    except Exception:
+        classes = ""
+    return f"{tag.get('id','')} {classes}"
+
+
+def _is_boilerplate_tag(tag) -> bool:
+    return bool(_BAD_RX.search(_cls_id(tag)))
+
+
+def root_domain(host: str) -> str:
+    parts = [p for p in (host or "").lower().split(".") if p]
+    return ".".join(parts[-2:]) if len(parts) > 2 else ".".join(parts)
+
+
+def is_same_site(href: str, base_host: str, base_root: str) -> bool:
+    try:
+        u = urlparse(href)
+        if u.scheme not in ("http", "https"):
+            return False
+        host = (u.hostname or "").lower()
+        return host == base_host or host.endswith("." + base_root)
+    except Exception:
+        return False
+
+
+def build_structured_page(html: str, url: str) -> dict:
+    """Turn a raw HTML page into a heading -> content section tree, same
+    shape the extension's coaching.js already knows how to render."""
+    soup = BeautifulSoup(html, "lxml")
+    parsed = urlparse(url)
+    base_host = (parsed.hostname or "").lower()
+    base_root = root_domain(base_host)
+
+    for tag in soup.find_all(["script", "style", "noscript", "iframe"]):
+        tag.decompose()
+
+    meta = extract_metadata(html, url)
+
+    sections: list = []
+    stack: dict = {}
+
+    def new_section(text: str, level: int) -> dict:
+        s = {"title": text, "level": level, "paragraphs": [], "bullets": []}
+        sections.append(s)
+        stack[level] = s
+        for lv in [lv for lv in stack if lv > level]:
+            del stack[lv]
+        return s
+
+    def current_section():
+        for lv in (4, 3, 2, 1):
+            if lv in stack:
+                return stack[lv]
+        return None
+
+    links, pdf_links, book_links, magazine_links = [], [], [], []
+    tag_links, category_links, pagination_links = [], [], []
+    seen_hrefs = set()
+    media, seen_media = [], set()
+    current_media_section = "Other"
+
+    for el in soup.find_all(["h1", "h2", "h3", "h4", "p", "li", "blockquote", "a", "img"]):
+        name = el.name
+
+        if name in ("h1", "h2", "h3", "h4"):
+            text = clean(el.get_text(" ", strip=True))
+            if not text:
+                continue
+            new_section(text, int(name[1]))
+            current_media_section = text
+            continue
+
+        if name in ("p", "li", "blockquote"):
+            if _is_boilerplate_tag(el):
+                continue
+            text = clean(el.get_text(" ", strip=True))
+            if not text:
+                continue
+            sec = current_section()
+            if not sec:
+                continue
+            if name == "li":
+                if len(text) >= 3:
+                    sec["bullets"].append(text)
+            elif len(text) >= 25:
+                sec["paragraphs"].append(text)
+            continue
+
+        if name == "img":
+            src = el.get("src") or el.get("data-src") or el.get("data-lazy-src") or ""
+            if not src:
+                continue
+            src = urljoin(url, src)
+            if not re.match(r"^https?://", src) or src in seen_media:
+                continue
+            alt = clean(el.get("alt", "") or "")
+            fig = el.find_parent("figure")
+            caption = ""
+            if fig is not None:
+                cap_tag = fig.find("figcaption")
+                if cap_tag:
+                    caption = clean(cap_tag.get_text(" ", strip=True))
+            hint = f"{alt} {caption} {' '.join(el.get('class') or [])}".lower()
+            kind = "map" if re.search(r"\b(map|gis|location|route|roadmap|political map|india map)\b", hint) else "image"
+            seen_media.add(src)
+            media.append({"src": src, "alt": alt, "caption": caption, "kind": kind, "section": current_media_section})
+            continue
+
+        if name == "a":
+            href = el.get("href") or ""
+            if not href:
+                continue
+            href = urljoin(url, href)
+            if not is_same_site(href, base_host, base_root):
+                continue
+            if _is_boilerplate_tag(el):
+                continue
+            link_title = (
+                clean(el.get_text(" ", strip=True))
+                or clean(el.get("aria-label", "") or "")
+                or clean(el.get("title", "") or "")
+            )
+            if not link_title or len(link_title) > 160 or href in seen_hrefs:
+                continue
+            seen_hrefs.add(href)
+            sec = current_section()
+            item = {"href": href, "title": link_title, "section": sec["title"] if sec else "Other useful links"}
+            path = urlparse(href).path.lower()
+            path_title = f"{path} {link_title}".lower()
+
+            if re.search(r"\.pdf(?:$|[?#])", href, re.I) or re.search(r"/pdf(?:/|$)", path):
+                pdf_links.append(item)
+            if re.search(r"\b(book|books|ebook|e-book)\b|/books?/", path_title):
+                book_links.append(item)
+            if re.search(r"\b(magazine|magazines|monthly|edition)\b|/magazines?/", path_title):
+                magazine_links.append(item)
+            if re.search(r"/tags?/", path):
+                tag_links.append(item)
+            if re.search(r"/category|/categories|/subjects?|/topics?|/section", path):
+                category_links.append(item)
+            if (
+                re.search(r"\b(next|previous|prev|older|newer)\b", path_title)
+                or re.search(r"[?&](page|paged)=\d+", href, re.I)
+                or re.search(r"/page/\d+", path)
+            ):
+                pagination_links.append(item)
+
+            articleish = bool(re.search(
+                r"/(daily-updates|current-affairs|news|editorial|article|articles|study|notes|"
+                r"courses|analysis|magazine|books?|topics?|subjects?|blog|upsc|ias|exam)",
+                path, re.I,
+            )) or len(link_title.split()) >= 4
+            if articleish and not re.search(r"/(login|signup|register|contact|privacy|terms|careers|about|search)\b", path, re.I):
+                links.append(item)
+
+    sections = [s for s in sections if s["paragraphs"] or s["bullets"]]
+    if not sections:
+        paras = []
+        for p in soup.find_all("p"):
+            if _is_boilerplate_tag(p):
+                continue
+            t = clean(p.get_text(" ", strip=True))
+            if len(t) >= 35:
+                paras.append(t)
+        if paras:
+            sections = [{"title": meta["title"] or "Page", "level": 1, "paragraphs": paras, "bullets": []}]
+
+    return {
+        "ok": True,
+        "url": url,
+        "pageTitle": meta["title"],
+        "description": meta["description"],
+        "author": meta["author"],
+        "date": meta["published"],
+        "sections": sections[:200],
+        "links": links[:240],
+        "pdfLinks": pdf_links[:80],
+        "bookLinks": book_links[:60],
+        "magazineLinks": magazine_links[:60],
+        "tagLinks": tag_links[:80],
+        "categoryLinks": category_links[:100],
+        "paginationLinks": pagination_links[:40],
+        "media": media[:40],
+        "heroImage": meta["image"],
+    }
+
+
+async def crawl_site(start_url: str, max_pages: int, max_depth: int, concurrency: int) -> dict:
+    if not is_public_url(start_url):
+        raise HTTPException(status_code=400, detail="Only public HTTP/HTTPS URLs are allowed.")
+
+    max_pages = max(1, min(100, max_pages))
+    max_depth = max(0, min(5, max_depth))
+    concurrency = max(1, min(12, concurrency))
+    sem = asyncio.Semaphore(concurrency)
+
+    async def fetch_one(u: str):
+        async with sem:
+            try:
+                html, final_url = await fetch_html(u)
+                return build_structured_page(html, final_url)
+            except Exception:
+                return None
+
+    seen: set = set()
+    all_links: list = []
+    first: dict | None = None
+    frontier = [start_url]
+    depth = 0
+
+    while frontier and len(seen) < max_pages and depth <= max_depth:
+        batch = []
+        for u in frontier:
+            if u not in seen and len(seen) + len(batch) < max_pages:
+                batch.append(u)
+        if not batch:
+            break
+        seen.update(batch)
+
+        results = await asyncio.gather(*[fetch_one(u) for u in batch])
+        next_frontier: dict = {}
+        for u, data in zip(batch, results):
+            if not data or not data.get("ok"):
+                continue
+            if first is None:
+                first = data
+            for link in data.get("links", []):
+                all_links.append({**link, "depth": depth})
+            if depth < max_depth:
+                base_host = (urlparse(u).hostname or "").lower()
+                root = root_domain(base_host)
+                for link in data.get("links", []):
+                    href = link["href"]
+                    host = (urlparse(href).hostname or "").lower()
+                    if (host == base_host or host.endswith("." + root)) and href not in seen:
+                        next_frontier[href] = True
+                for link in (data.get("paginationLinks") or [])[:4]:
+                    href = link["href"]
+                    if href not in seen:
+                        next_frontier[href] = True
+
+        remaining = max(0, (max_pages - len(seen)) * 2)
+        frontier = list(next_frontier.keys())[:remaining]
+        depth += 1
+
+    if first is None:
+        return {
+            "ok": False,
+            "error": "No public pages could be extracted. The site may require sign-in or block automated reading.",
+            "url": start_url,
+        }
+
+    dedup: dict = {}
+    for link in all_links:
+        dedup.setdefault(link["href"], link)
+
+    result = dict(first)
+    result["links"] = list(dedup.values())[:1000]
+    result["crawlPages"] = len(seen)
+    result["crawledUrls"] = list(seen)
+    return result
+
+
+@app.post("/explore")
+async def explore_endpoint(request: ExploreRequest):
+    """Structured single-page read (max_pages=1, max_depth=0) or a full
+    same-domain crawl ("Explore domain" in Coaching) — same endpoint, the
+    extension just varies max_pages/max_depth."""
+    return await crawl_site(
+        str(request.url),
+        max_pages=request.max_pages,
+        max_depth=request.max_depth,
+        concurrency=request.concurrency,
+    )
+
+
 @app.get("/image")
 async def proxy_image(url: str):
     """Fetch a publisher image server-side so hotlink/referrer blocking is less likely to blank cards."""
     if not is_public_url(url):
         raise HTTPException(status_code=400, detail="Only public HTTP/HTTPS image URLs are allowed.")
     headers = {
-        "User-Agent": pick_browser_profile(url)["User-Agent"],
+        "User-Agent": USER_AGENT,
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": url,
     }
     try:
-        client = await get_http_client()
-        r = await client.get(url, headers=headers, timeout=httpx.Timeout(15.0, connect=8.0))
-        r.raise_for_status()
-        ctype = (r.headers.get("content-type") or "").split(";", 1)[0].lower()
-        if not ctype.startswith("image/"):
-            raise HTTPException(status_code=415, detail="URL did not return an image")
-        if len(r.content) > 8_000_000:
-            raise HTTPException(status_code=413, detail="Image is too large")
-        return Response(
-            content=r.content,
-            media_type=ctype,
-            headers={"Cache-Control": "public, max-age=86400, stale-while-revalidate=604800"},
-        )
+        timeout = httpx.Timeout(15.0, connect=8.0)
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, max_redirects=5, timeout=timeout) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            ctype = (r.headers.get("content-type") or "").split(";", 1)[0].lower()
+            if not ctype.startswith("image/"):
+                raise HTTPException(status_code=415, detail="URL did not return an image")
+            if len(r.content) > 8_000_000:
+                raise HTTPException(status_code=413, detail="Image is too large")
+            return Response(
+                content=r.content,
+                media_type=ctype,
+                headers={"Cache-Control": "public, max-age=86400, stale-while-revalidate=604800"},
+            )
     except HTTPException:
         raise
     except Exception as exc:
@@ -904,7 +1058,12 @@ async def root():
         "service": "NEWS BYTE Source Extractor",
         "version": "1.4.0",
         "ai": False,
-        "usage": "POST /extract with {url, render, max_chars}",
+        "usage": {
+            "extract": "POST /extract with {url, render, max_chars} — single article, flat text.",
+            "explore": "POST /explore with {url, max_pages, max_depth, concurrency} — structured "
+                       "section tree + classified links for any site (news, coaching, govt). "
+                       "max_pages=1,max_depth=0 reads just one page; higher values crawl the domain.",
+        },
     }
 
 
