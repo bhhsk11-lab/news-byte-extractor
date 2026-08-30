@@ -1,6 +1,13 @@
+"""
+NEWS BYTE Source Extractor – Non‑AI article and site‑structure extraction.
+
+v1.6.0 – added Playwright fallback for Google News redirect resolution.
+"""
+
 import asyncio
 import ipaddress
 import json
+import logging
 import re
 import socket
 from datetime import datetime, timezone
@@ -13,16 +20,28 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
-# Import the new Google News resolver
-from gnews_resolver import resolve_google_news as gnews_resolve
+# ── Google News resolver with Playwright fallback ──────────────────
+from gnews_resolver import (
+    resolve_google_news as gnews_resolve,
+    init_playwright_pool,
+    shutdown_playwright_pool,
+)
+
+# ── Logging ──────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("news-byte-extractor")
 
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
     description="Non-AI source article + site‑structure extraction service for NEWS BYTE.",
-    version="1.5.0",
+    version="1.6.0",
 )
 
-# CORS – open for the extension
+# ── CORS ─────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,19 +50,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Constants ────────────────────────────────────────────────────────
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/149.0.0.0 Safari/537.36 NEWS-BYTE/1.0"
 )
-
 MAX_DOWNLOAD_BYTES = 8_000_000
 MIN_GOOD_WORDS = 120
 MIN_GOOD_SCORE = 0.30
 
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 # Google News URL helpers
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 
 def is_google_news_article_url(url: str) -> bool:
     try:
@@ -58,7 +77,10 @@ def is_google_news_article_url(url: str) -> bool:
         return False
 
 async def resolve_google_news_url(url: str):
-    """Resolve a Google News RSS redirect to the publisher URL using the new resolver."""
+    """
+    Resolve a Google News redirect to the real publisher URL.
+    Returns (resolved_url, method_or_error).
+    """
     if not is_google_news_article_url(url):
         return url, None
 
@@ -67,9 +89,9 @@ async def resolve_google_news_url(url: str):
         return resolved, method
     return url, method or "not-resolved"
 
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 # Pydantic models
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 
 class ExtractRequest(BaseModel):
     url: HttpUrl
@@ -82,9 +104,9 @@ class ExploreRequest(BaseModel):
     max_depth: int = 1
     concurrency: int = 8
 
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 # SSRF / URL safety
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 
 def is_public_url(url: str) -> bool:
     parsed = urlparse(url)
@@ -104,9 +126,9 @@ def is_public_url(url: str) -> bool:
         return False
     return True
 
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 # Text utilities
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 
 def clean(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
@@ -181,9 +203,9 @@ def clean_title(title: str, url: str) -> str:
                 return head
     return title
 
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 # Metadata extraction (JSON‑LD, Open Graph, etc.)
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 
 def parse_jsonld(html: str) -> dict:
     found = {}
@@ -325,9 +347,9 @@ def extract_metadata(html: str, url: str) -> dict:
         "jsonld": jsonld,
     }
 
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 # Core extraction
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 
 def extract_article(html: str, url: str, method: str) -> dict:
     meta = extract_metadata(html, url)
@@ -457,9 +479,9 @@ def extract_article(html: str, url: str, method: str) -> dict:
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 # Fetch helpers
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 
 async def fetch_html(url: str):
     headers = {
@@ -517,9 +539,9 @@ async def fetch_rendered(url: str):
         finally:
             await browser.close()
 
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 # Main extraction endpoint logic
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 
 async def extract_one(url: str, render: bool, max_chars: int):
     if not is_public_url(url):
@@ -609,9 +631,9 @@ async def extract_one(url: str, render: bool, max_chars: int):
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 # Explore / Coaching (structured extraction)
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 
 _BAD_RX = re.compile(
     r"(^|[-_ ])(ad|ads|advert|advertisement|banner|cookie|consent|subscribe|newsletter|"
@@ -877,9 +899,9 @@ async def crawl_site(start_url: str, max_pages: int, max_depth: int, concurrency
     result["crawledUrls"] = list(seen)
     return result
 
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 # FastAPI endpoints
-# ==========================
+# ──────────────────────────────────────────────────────────────────────
 
 @app.post("/explore")
 async def explore_endpoint(request: ExploreRequest):
@@ -924,7 +946,7 @@ async def proxy_image(url: str):
 async def root():
     return {
         "service": "NEWS BYTE Source Extractor",
-        "version": "1.5.0",
+        "version": "1.6.0",
         "ai": False,
         "usage": {
             "extract": "POST /extract with {url, render, max_chars} — single article, flat text.",
@@ -936,7 +958,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "news-byte-source-extractor", "ai": False}
+    return {"ok": True, "service": "news-byte-source-extractor", "ai": False, "version": "1.6.0"}
 
 @app.post("/extract")
 async def extract_endpoint(request: ExtractRequest):
@@ -945,6 +967,36 @@ async def extract_endpoint(request: ExtractRequest):
         request.render,
         min(max(request.max_chars, 1000), 100000),
     )
+
+# ──────────────────────────────────────────────────────────────────────
+# Lifeycle events (startup / shutdown)
+# ──────────────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup():
+    """
+    Initialize the Playwright browser pool used by the Google News resolver.
+    The pool size can be adjusted; 3 is a good balance for most instances.
+    """
+    try:
+        # We use a pool size of 3; reduce to 1 if memory is tight.
+        await init_playwright_pool(pool_size=3)
+        logger.info("Playwright pool initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize Playwright pool: {e}. Google News resolver may fall back to batchexecute only.")
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Clean up the Playwright browser pool."""
+    try:
+        await shutdown_playwright_pool()
+        logger.info("Playwright pool shut down.")
+    except Exception as e:
+        logger.error(f"Error during Playwright pool shutdown: {e}")
+
+# ──────────────────────────────────────────────────────────────────────
+# Main entry point (for local development)
+# ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
