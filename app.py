@@ -8,66 +8,21 @@ from urllib.parse import urlparse, urljoin
 
 import httpx
 import trafilatura
-try:
-    from googlenewsdecoder import gnewsdecoder
-except Exception:
-    gnewsdecoder = None
-
-# googlenewsdecoder's internal GoogleDecoder makes its HTTP calls with the
-# plain `requests` library and NO headers at all on the first call
-# (get_decoding_params) — meaning it self-identifies as
-# "User-Agent: python-requests/x.x" to news.google.com, with no Referer.
-# A single isolated call like that often slips through, but the extension
-# resolves 15-20 of these back-to-back on every feed load; a burst of
-# identically-fingerprinted, headerless requests from one IP is a textbook
-# bot-detection trigger, which lines up with decode succeeding in isolation
-# (confirmed via manual testing) but failing near-100% during real usage.
-# The library gives no way to pass custom headers into get_decoding_params,
-# so wrap requests.get itself before it's used. This only affects
-# googlenewsdecoder's calls: it accesses `requests.get(...)` via qualified
-# attribute lookup (not `from requests import get`), so reassigning the
-# attribute on the module object is visible to it; this app otherwise
-# uses httpx exclusively, so nothing else in this file is affected.
-# (Not patching requests.utils.default_headers / Session header init: those
-# are bound into requests.sessions via `from .utils import default_headers`
-# at requests' own import time, so patching the utils module after the fact
-# has no effect on Session — verified against the installed requests
-# version before relying on this.)
-try:
-    import requests as _requests
-
-    _ORIGINAL_REQUESTS_GET = _requests.get
-    _DECODER_HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://news.google.com/",
-    }
-
-    def _requests_get_with_browser_headers(url, **kwargs):
-        headers = dict(_DECODER_HEADERS)
-        headers.update(kwargs.pop("headers", None) or {})
-        return _ORIGINAL_REQUESTS_GET(url, headers=headers, **kwargs)
-
-    _requests.get = _requests_get_with_browser_headers
-except Exception:
-    pass
-
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
+# Import the new Google News resolver
+from gnews_resolver import resolve_google_news as gnews_resolve
+
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
-    description="Non-AI source article + site-structure extraction service for NEWS BYTE.",
-    version="1.4.0",
+    description="Non-AI source article + site‑structure extraction service for NEWS BYTE.",
+    version="1.5.0",
 )
 
-# NEWS BYTE is a personal extension. CORS is open so the extension can call
-# the Space directly. For a public service, restrict allow_origins.
+# CORS – open for the extension
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -86,77 +41,40 @@ MAX_DOWNLOAD_BYTES = 8_000_000
 MIN_GOOD_WORDS = 120
 MIN_GOOD_SCORE = 0.30
 
-# Google News RSS article links are encoded Google redirect URLs, not publisher
-# article URLs. Keep a small in-process cache to avoid resolving the same link
-# repeatedly during a feed refresh.
-GOOGLE_RESOLVE_CACHE = {}
-GOOGLE_RESOLVE_CACHE_MAX = 500
-# A feed refresh resolves 15-20 of these back to back. Each one is 1-2 plain,
-# identically-fingerprinted `requests` calls straight to news.google.com;
-# firing all of them at once from one IP is a plausible trigger for
-# short-lived soft-blocking (isolated manual calls succeed; bursts during
-# real usage were failing near-100%). Cap how many resolve concurrently so
-# they go out more like a browser tab-switching through a feed than a
-# scraper hammering an endpoint. (This was previously an unused
-# `asyncio.Lock()` here that nothing ever acquired — a semaphore of 3 keeps
-# some parallelism instead of fully serializing.)
-GOOGLE_RESOLVE_SEMAPHORE = asyncio.Semaphore(3)
-
+# ==========================
+# Google News URL helpers
+# ==========================
 
 def is_google_news_article_url(url: str) -> bool:
     try:
         host = (urlparse(url).hostname or "").lower()
         path = urlparse(url).path
         return host == "news.google.com" and (
-            path.startswith("/rss/articles/") or path.startswith("/articles/") or path.startswith("/read/")
+            path.startswith("/rss/articles/") or
+            path.startswith("/articles/") or
+            path.startswith("/read/")
         )
     except Exception:
         return False
 
-
 async def resolve_google_news_url(url: str):
-    """Resolve a Google News RSS redirect to the publisher URL."""
+    """Resolve a Google News RSS redirect to the publisher URL using the new resolver."""
     if not is_google_news_article_url(url):
         return url, None
 
-    cached = GOOGLE_RESOLVE_CACHE.get(url)
-    if cached:
-        return cached, "cache"
+    resolved, method = await gnews_resolve(url)
+    if resolved and resolved != url:
+        return resolved, method
+    return url, method or "not-resolved"
 
-    if gnewsdecoder is None:
-        return url, "decoder-unavailable"
-
-    async with GOOGLE_RESOLVE_SEMAPHORE:
-        try:
-            # The decoder makes up to two sequential, un-timed `requests` calls
-            # to news.google.com internally (see GoogleDecoder.get_decoding_params
-            # / decode_url in the googlenewsdecoder package — neither passes a
-            # timeout=). If Google is slow, soft-blocking this IP, or has changed
-            # the markup the decoder scrapes for data-n-a-sg/data-n-a-ts, this
-            # can hang far longer than is worth waiting on before falling back
-            # to the second extractor. Cap it hard.
-            result = await asyncio.wait_for(
-                asyncio.to_thread(gnewsdecoder, url, interval=0), timeout=8.0
-            )
-            if isinstance(result, dict) and result.get("status") and result.get("decoded_url"):
-                resolved = str(result["decoded_url"])
-                if is_public_url(resolved):
-                    if len(GOOGLE_RESOLVE_CACHE) >= GOOGLE_RESOLVE_CACHE_MAX:
-                        GOOGLE_RESOLVE_CACHE.pop(next(iter(GOOGLE_RESOLVE_CACHE)))
-                    GOOGLE_RESOLVE_CACHE[url] = resolved
-                    return resolved, "googlenewsdecoder"
-            return url, "decoder-failed"
-        except asyncio.TimeoutError:
-            return url, "decoder-timeout"
-        except Exception as exc:
-            return url, "decoder-" + type(exc).__name__
-
+# ==========================
+# Pydantic models
+# ==========================
 
 class ExtractRequest(BaseModel):
     url: HttpUrl
     render: bool = False
     max_chars: int = 60000
-
 
 class ExploreRequest(BaseModel):
     url: HttpUrl
@@ -164,46 +82,35 @@ class ExploreRequest(BaseModel):
     max_depth: int = 1
     concurrency: int = 8
 
+# ==========================
+# SSRF / URL safety
+# ==========================
 
 def is_public_url(url: str) -> bool:
-    """Basic SSRF protection: allow only public HTTP(S) destinations."""
     parsed = urlparse(url)
-
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return False
-
     host = parsed.hostname.lower()
-
     if host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".local"):
         return False
-
     try:
         addresses = socket.getaddrinfo(host, None)
         for info in addresses:
             ip = ipaddress.ip_address(info[4][0])
-            if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_multicast
-                or ip.is_reserved
-            ):
+            if (ip.is_private or ip.is_loopback or ip.is_link_local or
+                ip.is_multicast or ip.is_reserved):
                 return False
     except Exception:
         return False
-
     return True
 
+# ==========================
+# Text utilities
+# ==========================
 
 def clean(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
-
-# Lines that are common publisher chrome/boilerplate rather than article
-# content: share/follow prompts, app-download nags, cookie/legal notices,
-# "Also Read" cross-promo links, live-blog labels, etc. These regularly slip
-# through a plain paragraph split and make extracted "news" read like a page
-# full of ads and navigation instead of the story itself.
 _BOILERPLATE_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in (
@@ -243,26 +150,15 @@ _BOILERPLATE_PATTERNS = [
     )
 ]
 
-
 def is_boilerplate(paragraph: str) -> bool:
-    """True for lines that are page chrome rather than article prose."""
     text_l = paragraph.strip()
     if not text_l:
         return True
     if len(text_l) <= 60 and text_l.isupper():
-        # Short all-caps lines are almost always section/nav labels.
         return True
     return any(p.search(text_l) for p in _BOILERPLATE_PATTERNS)
 
-
 def clean_title(title: str, url: str) -> str:
-    """Strip a trailing ' | Publisher Name' / ' - Publisher Name' suffix.
-
-    Only strips when the trailing segment is short and either matches the
-    page's own domain or is short enough to plausibly be a site name, so a
-    real subtitle (e.g. "Budget 2026: What changes for you - explained")
-    is left alone.
-    """
     if not title:
         return title
     try:
@@ -285,23 +181,21 @@ def clean_title(title: str, url: str) -> str:
                 return head
     return title
 
+# ==========================
+# Metadata extraction (JSON‑LD, Open Graph, etc.)
+# ==========================
 
 def parse_jsonld(html: str) -> dict:
-    """Find NewsArticle/Article JSON-LD and return its useful fields."""
     found = {}
-
     soup = BeautifulSoup(html, "lxml")
-
     for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
         raw = script.string or script.get_text()
         if not raw:
             continue
-
         try:
             obj = json.loads(raw)
         except Exception:
             continue
-
         candidates = []
         if isinstance(obj, list):
             candidates.extend(obj)
@@ -309,38 +203,20 @@ def parse_jsonld(html: str) -> dict:
             candidates.append(obj)
             if isinstance(obj.get("@graph"), list):
                 candidates.extend(obj["@graph"])
-
         for item in candidates:
             if not isinstance(item, dict):
                 continue
-
             typ = item.get("@type", "")
             types = typ if isinstance(typ, list) else [typ]
-
-            if (
-                any(
-                    str(t).lower()
-                    in {"newsarticle", "article", "report", "blogposting"}
-                    for t in types
-                )
-                or isinstance(item.get("articleBody"), str)
-            ):
-                for key in (
-                    "headline",
-                    "articleBody",
-                    "datePublished",
-                    "dateModified",
-                    "description",
-                    "image",
-                    "author",
-                    "publisher",
-                ):
+            if (any(str(t).lower() in {"newsarticle", "article", "report", "blogposting"}
+                    for t in types)
+                or isinstance(item.get("articleBody"), str)):
+                for key in ("headline", "articleBody", "datePublished",
+                            "dateModified", "description", "image", "author", "publisher"):
                     if key in item:
                         found[key] = item[key]
                 return found
-
     return found
-
 
 def extract_metadata(html: str, url: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
@@ -353,30 +229,20 @@ def extract_metadata(html: str, url: str) -> dict:
                 return clean(tag["content"])
         return ""
 
-    title = (
-        clean(jsonld.get("headline", ""))
-        or meta(
-            ("property", "og:title"),
-            ("name", "twitter:title"),
-        )
-    )
+    title = (clean(jsonld.get("headline", ""))
+             or meta(("property", "og:title"), ("name", "twitter:title")))
 
     if not title:
         h1 = soup.find("h1")
         if h1:
             title = clean(h1.get_text(" ", strip=True))
-
     if not title and soup.title:
         title = clean(soup.title.get_text(" ", strip=True))
 
-    description = (
-        clean(jsonld.get("description", ""))
-        or meta(
-            ("property", "og:description"),
-            ("name", "description"),
-            ("name", "twitter:description"),
-        )
-    )
+    description = (clean(jsonld.get("description", ""))
+                   or meta(("property", "og:description"),
+                           ("name", "description"),
+                           ("name", "twitter:description")))
 
     def image_candidate(value):
         if isinstance(value, str):
@@ -385,9 +251,6 @@ def extract_metadata(html: str, url: str) -> dict:
                 return ""
             if value.startswith("//"):
                 value = "https:" + value
-            # Resolve relative to the page URL first (govt/coaching sites often
-            # publish og:image as a root-relative path like "/img/hero.jpg"),
-            # then apply the same absolute-URL + Google-News filtering as before.
             resolved = urljoin(url, value)
             if re.match(r"^https?://", resolved, re.I) and "news.google.com" not in resolved.lower():
                 return resolved
@@ -403,38 +266,27 @@ def extract_metadata(html: str, url: str) -> dict:
                     return got
         return ""
 
-    image = image_candidate(jsonld.get("image")) or meta(
-        ("property", "og:image"),
-        ("property", "og:image:url"),
-        ("property", "og:image:secure_url"),
-        ("name", "og:image"),
-        ("name", "twitter:image"),
-        ("name", "twitter:image:src"),
-    )
+    image = (image_candidate(jsonld.get("image"))
+             or meta(("property", "og:image"), ("property", "og:image:url"),
+                     ("property", "og:image:secure_url"), ("name", "og:image"),
+                     ("name", "twitter:image"), ("name", "twitter:image:src")))
     image = image_candidate(image)
 
-    # More publisher variants: <link rel=image_src>, lazy-loaded image attrs,
-    # and srcset. Prefer a reasonably large article image over tiny icons.
     if not image:
-        link_img = soup.find("link", attrs={"rel": re.compile(r"(^|\\s)image_src(\\s|$)", re.I)})
+        link_img = soup.find("link", attrs={"rel": re.compile(r"(^|\s)image_src(\s|$)", re.I)})
         image = image_candidate(link_img.get("href", "")) if link_img else ""
     if not image:
         imgs = []
         for tag in soup.find_all("img"):
             classes = " ".join(tag.get("class", []))
-            marker = " ".join([
-                str(tag.get("alt", "")), classes, str(tag.get("id", "")),
-                str(tag.get("data-testid", ""))
-            ]).lower()
+            marker = " ".join([str(tag.get("alt", "")), classes,
+                               str(tag.get("id", "")), str(tag.get("data-testid", ""))]).lower()
             if any(x in marker for x in ("logo", "avatar", "icon", "author", "profile", "social")):
                 continue
-            candidates = [
-                tag.get("src"), tag.get("data-src"), tag.get("data-original"),
-                tag.get("data-lazy-src"), tag.get("data-image"), tag.get("data-url")
-            ]
+            candidates = [tag.get("src"), tag.get("data-src"), tag.get("data-original"),
+                          tag.get("data-lazy-src"), tag.get("data-image"), tag.get("data-url")]
             srcset = tag.get("srcset") or tag.get("data-srcset")
             if srcset:
-                # Usually the final/largest candidate is the best one.
                 candidates.append(srcset.split(",")[-1].strip().split(" ")[0])
             for c in candidates:
                 got = image_candidate(c)
@@ -462,12 +314,7 @@ def extract_metadata(html: str, url: str) -> dict:
     elif author_data:
         author = clean(str(author_data))
 
-    published = clean(
-        str(
-            jsonld.get("datePublished", "")
-            or jsonld.get("dateModified", "")
-        )
-    )
+    published = clean(str(jsonld.get("datePublished", "") or jsonld.get("dateModified", "")))
 
     return {
         "title": title,
@@ -478,14 +325,14 @@ def extract_metadata(html: str, url: str) -> dict:
         "jsonld": jsonld,
     }
 
+# ==========================
+# Core extraction
+# ==========================
 
 def extract_article(html: str, url: str, method: str) -> dict:
     meta = extract_metadata(html, url)
-
     data = {}
     try:
-        # Trafilatura 2.2 returns a Document object by default.
-        # Convert it explicitly before accessing fields.
         doc = trafilatura.bare_extraction(
             html,
             url=url,
@@ -510,9 +357,8 @@ def extract_article(html: str, url: str, method: str) -> dict:
                     "image": getattr(doc, "image", "") or "",
                 }
     except Exception:
-        data = {}
+        pass
 
-    # Plain-text Trafilatura fallback.
     if not data.get("text"):
         try:
             plain = trafilatura.extract(
@@ -532,13 +378,13 @@ def extract_article(html: str, url: str, method: str) -> dict:
     published = clean(data.get("date", "")) or meta["published"]
     image = clean(data.get("image", "")) or meta["image"]
 
-    # JSON-LD articleBody fallback.
+    # JSON‑LD articleBody fallback
     body = meta["jsonld"].get("articleBody")
     if isinstance(body, str) and len(body) > len(text):
         text = clean(body)
         method += "+jsonld"
 
-    # Common publisher DOM fallback when structured extraction is short.
+    # DOM fallback if extraction is short
     if len(text.split()) < 120:
         try:
             soup = BeautifulSoup(html, "lxml")
@@ -569,41 +415,25 @@ def extract_article(html: str, url: str, method: str) -> dict:
     paragraphs = []
     seen = set()
     junk_dropped = 0
-
     raw_text = data.get("text", "") or text
 
     for raw in re.split(r"\n+", raw_text):
         paragraph = clean(raw)
-
         if len(paragraph) < 40:
             continue
-
         if is_boilerplate(paragraph):
             junk_dropped += 1
             continue
-
         key = re.sub(r"[^a-z0-9]+", " ", paragraph.lower()).strip()
-
         if not key or key in seen:
             continue
-
         seen.add(key)
         paragraphs.append(paragraph)
 
-    # Rebuild the plain-text body from the cleaned, deduplicated,
-    # boilerplate-free paragraphs instead of returning the raw blob. Anything
-    # that reads `text` (rather than `paragraphs`) then gets the same "proper
-    # news" content, not leftover nav/ad/share-prompt lines that slipped past
-    # the paragraph split.
     text = "\n\n".join(paragraphs) if paragraphs else text
     title = clean_title(title, url)
 
     words = len(text.split())
-
-    # A practical quality score for deciding whether to use the fast result
-    # or spend time rendering the page. A page that was mostly boilerplate
-    # (lots of dropped junk lines relative to kept paragraphs) is penalized,
-    # since that's a signal the real article body wasn't cleanly isolated.
     word_score = min(1.0, words / 900)
     paragraph_score = min(1.0, len(paragraphs) / 10)
     junk_ratio = junk_dropped / max(1, junk_dropped + len(paragraphs))
@@ -627,6 +457,9 @@ def extract_article(html: str, url: str, method: str) -> dict:
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
+# ==========================
+# Fetch helpers
+# ==========================
 
 async def fetch_html(url: str):
     headers = {
@@ -637,9 +470,7 @@ async def fetch_html(url: str):
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
-
     timeout = httpx.Timeout(20.0, connect=10.0)
-
     async with httpx.AsyncClient(
         headers=headers,
         follow_redirects=True,
@@ -648,29 +479,21 @@ async def fetch_html(url: str):
     ) as client:
         async with client.stream("GET", url) as response:
             response.raise_for_status()
-
             content_type = response.headers.get("content-type", "").lower()
             if "html" not in content_type and "xml" not in content_type:
                 raise ValueError("Source response is not HTML")
-
             chunks = []
             total = 0
-
             async for chunk in response.aiter_bytes():
                 total += len(chunk)
-
                 if total > MAX_DOWNLOAD_BYTES:
                     raise ValueError("Source HTML is too large")
-
                 chunks.append(chunk)
-
             html = b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
-
             return html, str(response.url)
 
-
 async def fetch_rendered(url: str):
-    """Optional browser fallback; Playwright is not installed in the free build."""
+    """Optional browser fallback; Playwright is not installed in free build."""
     try:
         from playwright.async_api import async_playwright
     except ImportError as exc:
@@ -694,31 +517,24 @@ async def fetch_rendered(url: str):
         finally:
             await browser.close()
 
+# ==========================
+# Main extraction endpoint logic
+# ==========================
 
 async def extract_one(url: str, render: bool, max_chars: int):
     if not is_public_url(url):
-        raise HTTPException(
-            status_code=400,
-            detail="Only public HTTP/HTTPS URLs are allowed.",
-        )
+        raise HTTPException(status_code=400, detail="Only public HTTP/HTTPS URLs are allowed.")
 
     errors = []
     requested_url = url
     last_result = None
 
-    # Google News RSS gives encoded /rss/articles/ URLs. They usually return a
-    # Google interstitial to plain HTTP clients, so resolve them first.
+    # Resolve Google News URLs
     resolved_url, resolve_method = await resolve_google_news_url(url)
     url = resolved_url
-    if resolve_method and resolve_method not in ("cache", "googlenewsdecoder"):
+    if resolve_method and resolve_method not in ("cache", "not-resolved"):
         errors.append("google-resolve:" + resolve_method)
-        # If this was a Google News link and we still only have the raw
-        # news.google.com redirect (not a publisher URL), fetch_html() below
-        # is guaranteed to fail on it too (Google serves an interstitial to
-        # plain HTTP clients) — that's the http:HTTPStatusError that always
-        # rides along with google-resolve:decoder-failed in the logs. Don't
-        # spend another ~10-20s httpx timeout finding that out; fail fast so
-        # the extension can fail over to the second extractor sooner.
+        # If still a Google News URL, fail fast
         if is_google_news_article_url(url):
             return {
                 "ok": False,
@@ -740,45 +556,29 @@ async def extract_one(url: str, render: bool, max_chars: int):
                 "fetched_at": datetime.now(timezone.utc).isoformat(),
             }
 
-    # FAST PATH: ordinary HTTP request.
+    # Fast path: HTTP + Trafilatura
     try:
         html, final_url = await fetch_html(url)
-
-        result = extract_article(
-            html,
-            final_url,
-            "http+trafilatura",
-        )
+        result = extract_article(html, final_url, "http+trafilatura")
         result["requested_url"] = requested_url
         result["resolved_url"] = final_url
         result["google_resolve"] = resolve_method
         last_result = result
 
-        if (
-            result["word_count"] >= MIN_GOOD_WORDS
-            and result["extraction_score"] >= MIN_GOOD_SCORE
-        ):
+        if result["word_count"] >= MIN_GOOD_WORDS and result["extraction_score"] >= MIN_GOOD_SCORE:
             result["text"] = result["text"][:max_chars]
             return result
-
     except Exception as exc:
         errors.append("http:" + type(exc).__name__)
 
-    # FALLBACK: render JavaScript-heavy pages.
+    # Fallback: render with Playwright if requested
     if render:
         try:
             html, final_url = await fetch_rendered(url)
-
-            result = extract_article(
-                html,
-                final_url,
-                "playwright+trafilatura",
-            )
-
+            result = extract_article(html, final_url, "playwright+trafilatura")
             if result["ok"]:
                 result["text"] = result["text"][:max_chars]
                 return result
-
         except Exception as exc:
             errors.append("render:" + type(exc).__name__)
 
@@ -809,18 +609,9 @@ async def extract_one(url: str, render: bool, max_chars: int):
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
-
-# ---------------------------------------------------------------------------
-# Explore / Coaching: deep structured extraction + same-domain crawl.
-#
-# This is a server-side port of the extension's old client-side
-# pageStructuredExtractor()/crawlSite() (background.js). Moving it here means
-# the extension never has to open a background tab or juggle a dozen
-# concurrent fetches through an offscreen document to "explore" a site (govt
-# sites, coaching sites, anything) — it just POSTs a URL and gets back a
-# heading -> paragraphs/bullets section tree plus classified same-domain
-# links (PDFs, books, magazines, pagination, tags, categories) and media.
-# ---------------------------------------------------------------------------
+# ==========================
+# Explore / Coaching (structured extraction)
+# ==========================
 
 _BAD_RX = re.compile(
     r"(^|[-_ ])(ad|ads|advert|advertisement|banner|cookie|consent|subscribe|newsletter|"
@@ -830,7 +621,6 @@ _BAD_RX = re.compile(
     re.I,
 )
 
-
 def _cls_id(tag) -> str:
     try:
         classes = " ".join(tag.get("class") or [])
@@ -838,15 +628,12 @@ def _cls_id(tag) -> str:
         classes = ""
     return f"{tag.get('id','')} {classes}"
 
-
 def _is_boilerplate_tag(tag) -> bool:
     return bool(_BAD_RX.search(_cls_id(tag)))
-
 
 def root_domain(host: str) -> str:
     parts = [p for p in (host or "").lower().split(".") if p]
     return ".".join(parts[-2:]) if len(parts) > 2 else ".".join(parts)
-
 
 def is_same_site(href: str, base_host: str, base_root: str) -> bool:
     try:
@@ -858,10 +645,7 @@ def is_same_site(href: str, base_host: str, base_root: str) -> bool:
     except Exception:
         return False
 
-
 def build_structured_page(html: str, url: str) -> dict:
-    """Turn a raw HTML page into a heading -> content section tree, same
-    shape the extension's coaching.js already knows how to render."""
     soup = BeautifulSoup(html, "lxml")
     parsed = urlparse(url)
     base_host = (parsed.hostname or "").lower()
@@ -974,11 +758,9 @@ def build_structured_page(html: str, url: str) -> dict:
                 tag_links.append(item)
             if re.search(r"/category|/categories|/subjects?|/topics?|/section", path):
                 category_links.append(item)
-            if (
-                re.search(r"\b(next|previous|prev|older|newer)\b", path_title)
+            if (re.search(r"\b(next|previous|prev|older|newer)\b", path_title)
                 or re.search(r"[?&](page|paged)=\d+", href, re.I)
-                or re.search(r"/page/\d+", path)
-            ):
+                or re.search(r"/page/\d+", path)):
                 pagination_links.append(item)
 
             articleish = bool(re.search(
@@ -1019,7 +801,6 @@ def build_structured_page(html: str, url: str) -> dict:
         "media": media[:40],
         "heroImage": meta["image"],
     }
-
 
 async def crawl_site(start_url: str, max_pages: int, max_depth: int, concurrency: int) -> dict:
     if not is_public_url(start_url):
@@ -1096,12 +877,12 @@ async def crawl_site(start_url: str, max_pages: int, max_depth: int, concurrency
     result["crawledUrls"] = list(seen)
     return result
 
+# ==========================
+# FastAPI endpoints
+# ==========================
 
 @app.post("/explore")
 async def explore_endpoint(request: ExploreRequest):
-    """Structured single-page read (max_pages=1, max_depth=0) or a full
-    same-domain crawl ("Explore domain" in Coaching) — same endpoint, the
-    extension just varies max_pages/max_depth."""
     return await crawl_site(
         str(request.url),
         max_pages=request.max_pages,
@@ -1109,10 +890,8 @@ async def explore_endpoint(request: ExploreRequest):
         concurrency=request.concurrency,
     )
 
-
 @app.get("/image")
 async def proxy_image(url: str):
-    """Fetch a publisher image server-side so hotlink/referrer blocking is less likely to blank cards."""
     if not is_public_url(url):
         raise HTTPException(status_code=400, detail="Only public HTTP/HTTPS image URLs are allowed.")
     headers = {
@@ -1141,12 +920,11 @@ async def proxy_image(url: str):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Image fetch failed: {type(exc).__name__}") from exc
 
-
 @app.get("/")
 async def root():
     return {
         "service": "NEWS BYTE Source Extractor",
-        "version": "1.4.0",
+        "version": "1.5.0",
         "ai": False,
         "usage": {
             "extract": "POST /extract with {url, render, max_chars} — single article, flat text.",
@@ -1156,15 +934,9 @@ async def root():
         },
     }
 
-
 @app.get("/health")
 async def health():
-    return {
-        "ok": True,
-        "service": "news-byte-source-extractor",
-        "ai": False,
-    }
-
+    return {"ok": True, "service": "news-byte-source-extractor", "ai": False}
 
 @app.post("/extract")
 async def extract_endpoint(request: ExtractRequest):
@@ -1173,7 +945,6 @@ async def extract_endpoint(request: ExtractRequest):
         request.render,
         min(max(request.max_chars, 1000), 100000),
     )
-
 
 if __name__ == "__main__":
     import uvicorn
