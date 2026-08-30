@@ -1,15 +1,27 @@
-"""Google News redirect resolver.
-
-Resolution order:
-1. direct ``url=`` query parameter
-2. offline base64/protobuf decoding (older IDs)
-3. Google HTML payload inspection (data-n-a-uc / data-n-au + external links)
-4. Playwright Chromium navigation (real browser redirect / consent handling)
-5. batchexecute Fbv4je RPC (legacy/current fallback)
-
-The resolver is intentionally isolated so the article extractor can call it
-without knowing which strategy succeeded.
 """
+Robust Google News article URL resolver.
+
+The important rule is: NEVER treat a Google-hosted asset such as
+lh3.googleusercontent.com, gstatic.com, googleapis.com, etc. as the
+publisher URL.
+
+Resolution strategy:
+  1. Explicit ?url= parameter when present.
+  2. Legacy protobuf/base64 URLs that still contain the source URL.
+  3. Current Google News page parameters:
+       - c-wiz[data-p] payload
+       - data-n-a-id / data-n-a-sg / data-n-a-ts
+       - equivalent attributes on c-wiz/div
+  4. Fbv4je / garturlreq batchexecute RPC using Google's current payload.
+  5. Browser navigation as a last resort.
+  6. A second batchexecute attempt using the legacy parameter shape.
+
+This module is intentionally conservative: a URL is returned only when it
+passes publisher validation. Google CDN URLs are never accepted as articles.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import base64
 import json
@@ -19,221 +31,711 @@ import re
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from html import unescape
+from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from curl_cffi import requests as cffi_requests
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-logger = logging.getLogger("gnews-resolver")
+try:
+    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+except Exception:
+    async_playwright = None
+    PlaywrightTimeoutError = Exception
 
-_BATCHEXECUTE_URL = "https://news.google.com/_/DotsSplashUi/data/batchexecute?rpcids=Fbv4je"
-_CACHE_MAX = 2000
-_CACHE = OrderedDict()
-_LOCK = asyncio.Lock()
-_LAST_CALL_TS = 0.0
-_MIN_INTERVAL_S = 0.75
 
-BROWSER_POOL_SIZE = max(1, int(os.getenv("GNEWS_BROWSER_POOL_SIZE", "3")))
-PLAYWRIGHT_TIMEOUT_MS = max(3000, int(os.getenv("GNEWS_PLAYWRIGHT_TIMEOUT_MS", "12000")))
-PLAYWRIGHT_REDIRECT_WAIT_MS = max(500, int(os.getenv("GNEWS_REDIRECT_WAIT_MS", "5000")))
+log = logging.getLogger("gnews-resolver")
+
+GOOGLE_NEWS_HOSTS = {
+    "news.google.com",
+    "news.googleusercontent.com",
+}
+
+GOOGLE_ASSET_SUFFIXES = (
+    "gstatic.com",
+    "googleapis.com",
+    "googleusercontent.com",
+    "googlevideo.com",
+    "ggpht.com",
+)
+
+BATCHEXECUTE_URL = (
+    "https://news.google.com/_/DotsSplashUi/data/batchexecute"
+    "?rpcids=Fbv4je"
+)
+
+CACHE_MAX = max(100, int(os.getenv("GNEWS_CACHE_MAX", "4000")))
+CACHE_TTL = max(60, int(os.getenv("GNEWS_CACHE_TTL", "86400")))
+MIN_RPC_INTERVAL = max(0.2, float(os.getenv("GNEWS_MIN_RPC_INTERVAL", "0.8")))
+
+HTTP_TIMEOUT = max(5, float(os.getenv("GNEWS_HTTP_TIMEOUT", "15")))
+BROWSER_TIMEOUT_MS = max(3000, int(os.getenv("GNEWS_PLAYWRIGHT_TIMEOUT_MS", "12000")))
+BROWSER_WAIT_MS = max(500, int(os.getenv("GNEWS_REDIRECT_WAIT_MS", "4500")))
+BROWSER_POOL_SIZE = max(1, int(os.getenv("GNEWS_BROWSER_POOL_SIZE", "2")))
+
+USER_AGENT = os.getenv(
+    "GNEWS_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/149.0.0.0 Safari/537.36",
+)
+
+_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
+_rpc_lock = asyncio.Lock()
+_last_rpc = 0.0
 
 _playwright = None
 _browser_pool = None
-_browser_start_lock = asyncio.Lock()
+_browser_lock = asyncio.Lock()
 
 
 def is_google_news_url(url: str) -> bool:
     try:
-        host = (urlparse(url).hostname or "").lower()
-        path = (urlparse(url).path or "").lower()
+        p = urlparse(url)
+        host = (p.hostname or "").lower()
+        path = (p.path or "").lower()
         return host == "news.google.com" and (
             path.startswith("/rss/articles/")
             or path.startswith("/articles/")
             or path.startswith("/read/")
+            or path.startswith("/__i/rss/rd/articles/")
         )
     except Exception:
         return False
 
 
-def _cache_get(url: str):
-    value = _CACHE.get(url)
-    if value:
-        _CACHE.move_to_end(url)
+def _cache_get(key: str) -> str | None:
+    item = _cache.get(key)
+    if not item:
+        return None
+    ts, value = item
+    if time.monotonic() - ts > CACHE_TTL:
+        _cache.pop(key, None)
+        return None
+    _cache.move_to_end(key)
     return value
 
 
-def _cache_put(url: str, resolved: str):
-    if not resolved or resolved == url or "news.google.com" in resolved:
+def _cache_put(key: str, value: str) -> None:
+    if not value or not _is_publisher_url(value):
         return
-    _CACHE[url] = resolved
-    _CACHE.move_to_end(url)
-    while len(_CACHE) > _CACHE_MAX:
-        _CACHE.popitem(last=False)
+    _cache[key] = (time.monotonic(), value)
+    _cache.move_to_end(key)
+    while len(_cache) > CACHE_MAX:
+        _cache.popitem(last=False)
 
 
-def _proxy_dict():
-    proxy = os.getenv("GNEWS_PROXY_URL", "").strip()
-    return {"http": proxy, "https": proxy} if proxy else None
+def _proxy() -> dict[str, str] | None:
+    value = os.getenv("GNEWS_PROXY_URL", "").strip()
+    return {"http": value, "https": value} if value else None
 
 
-def _is_external(url: str) -> bool:
+def _host(url: str) -> str:
     try:
-        host = (urlparse(url).hostname or "").lower()
-        return bool(host) and not (
-            host == "google.com"
-            or host.endswith(".google.com")
-            or host.endswith("gstatic.com")
-            or host.endswith("googleapis.com")
-            or host == "w3.org"
-            or host.endswith(".w3.org")
-            or host == "schema.org"
-            or host.endswith(".schema.org")
-        )
+        return (urlparse(url).hostname or "").lower().rstrip(".")
+    except Exception:
+        return ""
+
+
+def _is_google_host(host: str) -> bool:
+    if not host:
+        return True
+    return (
+        host == "google.com"
+        or host.endswith(".google.com")
+        or host.endswith(".google.co.uk")
+        or host.endswith(".google.co.in")
+        or any(host.endswith("." + suffix) or host == suffix
+               for suffix in GOOGLE_ASSET_SUFFIXES)
+    )
+
+
+def _is_publisher_url(url: str) -> bool:
+    """Strict target validation. Google CDN/assets can never be a target."""
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return False
+
+        host = p.hostname.lower().rstrip(".")
+        if _is_google_host(host):
+            return False
+
+        if host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".local"):
+            return False
+
+        # Reject obvious non-page assets.
+        path = (p.path or "").lower()
+        if path.endswith((
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+            ".ico", ".css", ".js", ".woff", ".woff2", ".mp4", ".webm",
+        )):
+            return False
+
+        return True
     except Exception:
         return False
 
 
-def _clean_candidate(value: str) -> str | None:
-    if not value:
+def _clean_url(value: Any) -> str | None:
+    if value is None:
         return None
-    value = unquote(value).replace("&amp;", "&").strip().strip('\\"\'<>')
-    if value.startswith("\\u003d"):
-        value = value[6:]
-    if value.startswith("http://") or value.startswith("https://"):
+
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "ignore")
+
+    value = unescape(str(value))
+    value = value.replace("\\/", "/")
+    value = value.replace("\\u0026", "&")
+    value = value.replace("\\u003d", "=")
+    value = value.replace("\\u002F", "/")
+    value = unquote(value)
+    value = value.strip().strip("\"'<>[](),")
+
+    # Some Google payloads contain JSON-escaped URLs.
+    if "\\x3a" in value:
+        value = value.replace("\\x3a", ":")
+    if "\\x2f" in value:
+        value = value.replace("\\x2f", "/")
+
+    if value.startswith(("http://", "https://")) and _is_publisher_url(value):
         return value
     return None
 
 
-# ---------- Strategy 1: offline protobuf/base64 ----------
-def _decode_offline(b64: str) -> str | None:
+def _article_id(url: str) -> str | None:
     try:
-        raw = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
+        path = urlparse(url).path.rstrip("/")
+        marker = "/articles/"
+        if marker in path:
+            return path.split(marker, 1)[1].split("/", 1)[0]
+        marker = "/rd/articles/"
+        if marker in path:
+            return path.split(marker, 1)[1].split("/", 1)[0]
+        marker = "/rss/articles/"
+        if marker in path:
+            return path.split(marker, 1)[1].split("/", 1)[0]
     except Exception:
-        return None
-    candidates = [raw]
-    if raw.startswith(b"\x08\x13\x22"):
-        candidates.append(raw[3:])
-    for data in candidates:
-        if data.endswith(b"\xd2\x01\x00"):
-            data = data[:-3]
-        if not data:
-            continue
-        for offset in (0, 1, 2):
-            if len(data) <= offset:
-                continue
-            tail = data[offset:]
-            # Try protobuf length-delimited field at the beginning.
-            if tail and tail[0] < 0x80:
-                end = 1 + tail[0]
-                if end <= len(tail):
-                    out = _clean_candidate(tail[1:end].decode("utf-8", errors="ignore"))
-                    if out and _is_external(out):
-                        return out
-            text = tail.decode("utf-8", errors="ignore")
-            m = re.search(r"https?://[^\x00\"'<>\s]+", text)
-            if m:
-                out = _clean_candidate(m.group(0))
-                if out and _is_external(out):
-                    return out
+        pass
     return None
 
 
-# ---------- Strategy 2: HTML payload inspection ----------
-def _get_redirect_page(url: str):
+# ---------------------------------------------------------------------------
+# Legacy URL format
+# ---------------------------------------------------------------------------
+
+def _decode_legacy_base64(article_id: str) -> str | None:
+    try:
+        raw = base64.urlsafe_b64decode(article_id + "=" * (-len(article_id) % 4))
+    except Exception:
+        return None
+
+    # Old format commonly starts with protobuf bytes 08 13 22 and ends d2 01 00.
+    blobs = [raw]
+    if raw.startswith(b"\x08\x13\x22"):
+        blobs.append(raw[3:])
+
+    for blob in blobs:
+        if blob.endswith(b"\xd2\x01\x00"):
+            blob = blob[:-3]
+
+        # Scan for a real URL rather than assuming a fixed protobuf offset.
+        text = blob.decode("utf-8", "ignore")
+        for match in re.finditer(r"https?://[^\x00\s\"'<>]+", text):
+            target = _clean_url(match.group(0))
+            if target:
+                return target
+
+        # Also try length-delimited protobuf strings near the beginning.
+        for offset in range(min(8, len(blob))):
+            if offset >= len(blob):
+                break
+            first = blob[offset]
+            if first < 0x80:
+                end = offset + 1 + first
+                if end <= len(blob):
+                    target = _clean_url(
+                        blob[offset + 1:end].decode("utf-8", "ignore")
+                    )
+                    if target:
+                        return target
+    return None
+
+
+# ---------------------------------------------------------------------------
+# HTTP session / Google page
+# ---------------------------------------------------------------------------
+
+def _google_get(url: str):
     return cffi_requests.get(
         url,
         impersonate="chrome124",
-        timeout=15,
+        timeout=HTTP_TIMEOUT,
         allow_redirects=True,
-        proxies=_proxy_dict(),
+        proxies=_proxy(),
         headers={
-            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Cache-Control": "no-cache",
         },
     )
 
 
-def _extract_html_target(html: str) -> str | None:
-    # Mirrors the useful fallback from the supplied JS resolver.
-    for pattern in (
-        r'data-n-a-uc="([^"]+)"',
-        r'data-n-au="([^"]+)"',
-        r"data-n-a-uc='([^']+)'",
-        r"data-n-au='([^']+)'",
-    ):
+def _get_page(url: str):
+    """Try /articles first because current Google implementations expose
+    decoding metadata there more reliably; fall back to the original URL."""
+    aid = _article_id(url)
+    urls = []
+    if aid:
+        urls.append(f"https://news.google.com/articles/{aid}")
+        urls.append(f"https://news.google.com/rss/articles/{aid}")
+    urls.append(url)
+
+    seen = set()
+    last = None
+
+    for candidate in urls:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            response = _google_get(candidate)
+            last = response
+            if response.status_code == 200 and response.text:
+                return response
+        except Exception as exc:
+            log.debug("Google GET failed for %s: %s", candidate, exc)
+
+    return last
+
+
+def _extract_attr(html: str, name: str) -> str | None:
+    patterns = [
+        rf'\b{name}\s*=\s*"([^"]+)"',
+        rf"\b{name}\s*=\s*'([^']+)'",
+        rf'\b{name}\s*=\s*\\?"([^"\\]+)\\?"',
+    ]
+    for pattern in patterns:
         m = re.search(pattern, html, re.I)
         if m:
-            target = _clean_candidate(m.group(1))
-            if target and _is_external(target):
-                return target
-
-    # JSON/escaped variants sometimes appear in Google's HTML.
-    for pattern in (
-        r'data-n-a-uc\\?[:=]\\?["\'](https?://[^"\'\\]+)',
-        r'data-n-au\\?[:=]\\?["\'](https?://[^"\'\\]+)',
-    ):
-        m = re.search(pattern, html, re.I)
-        if m:
-            target = _clean_candidate(m.group(1))
-            if target and _is_external(target):
-                return target
-
-    # Last HTML fallback: first external absolute URL.
-    for candidate in re.findall(r"https?://[^\s\"'<>\{\}\[\]`]+", html, re.I):
-        target = _clean_candidate(candidate)
-        if target and _is_external(target):
-            return target
+            return unescape(m.group(1))
     return None
 
 
-async def _html_resolve(url: str):
+def _extract_current_params(html: str, article_id: str) -> dict[str, Any]:
+    """
+    Current Google pages have used two useful representations:
+      c-wiz[data-p] with a serialized garturlreq structure
+      c-wiz/div data-n-a-id + data-n-a-ts + data-n-a-sg
+    """
+    result: dict[str, Any] = {
+        "id": article_id,
+        "timestamp": None,
+        "signature": None,
+        "data_p": None,
+    }
+
+    # First: explicit attributes.
+    for key, attr in (
+        ("timestamp", "data-n-a-ts"),
+        ("signature", "data-n-a-sg"),
+        ("id", "data-n-a-id"),
+    ):
+        value = _extract_attr(html, attr)
+        if value:
+            result[key] = value
+
+    # Second: data-p. This is especially important for the newer format.
+    for pattern in (
+        r'<c-wiz\b[^>]*\bdata-p\s*=\s*"([^"]+)"',
+        r"<c-wiz\b[^>]*\bdata-p\s*=\s*'([^']+)'",
+        r'\bdata-p\s*=\s*"([^"]+)"',
+        r"\bdata-p\s*=\s*'([^']+)'",
+    ):
+        m = re.search(pattern, html, re.I | re.S)
+        if m:
+            result["data_p"] = unescape(m.group(1))
+            break
+
+    return result
+
+
+def _decode_data_p(data_p: str) -> list[Any] | None:
+    if not data_p:
+        return None
+
+    candidates = [
+        data_p,
+        data_p.replace("%.@.", '["garturlreq",'),
+    ]
+
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, list):
+                return obj
+        except Exception:
+            pass
+
+    # Sometimes the attribute itself is escaped.
     try:
-        response = await asyncio.to_thread(_get_redirect_page, url)
-        final = str(getattr(response, "url", "") or "")
-        if final and _is_external(final):
-            return final, "html-redirect"
-        target = _extract_html_target(response.text)
+        candidate = bytes(data_p, "utf-8").decode("unicode_escape")
+        obj = json.loads(candidate)
+        if isinstance(obj, list):
+            return obj
+    except Exception:
+        pass
+
+    return None
+
+
+def _build_rpc_from_data_p(data_p: str) -> str | None:
+    """
+    Current/observed format:
+      c-wiz[data-p] contains a serialized garturlreq request.
+
+    The public reverse-engineered clients send that request to Fbv4je after
+    removing the browser-only tail fields.
+    """
+    obj = _decode_data_p(data_p)
+    if not obj:
+        return None
+
+    try:
+        # The data-p object itself normally begins with garturlreq.
+        if obj[0] == "garturlreq":
+            # Keep the request and remove browser-only fields at the end.
+            # This mirrors the current working implementations while avoiding
+            # hard-coding a locale-specific request.
+            if len(obj) >= 3:
+                core = obj[:-6] + obj[-2:]
+            else:
+                core = obj
+
+            inner = json.dumps(core, separators=(",", ":"))
+            outer = [[[
+                "Fbv4je",
+                inner,
+                None,
+                "generic",
+            ]]]
+
+            return "f.req=" + quote(
+                json.dumps(outer, separators=(",", ":")),
+                safe="",
+            )
+    except Exception:
+        log.exception("Failed to build RPC from data-p")
+
+    return None
+
+
+def _build_rpc_legacy(article_id: str, timestamp: str, signature: str) -> str:
+    """
+    Legacy/current fallback shape used by several working Google News
+    decoders. Locale is intentionally fixed to en-US/US for deterministic
+    server-side resolution.
+    """
+    inner = [
+        "garturlreq",
+        [[
+            ["X", "X", ["FINANCE_TOP_INDICES", "WEB_TEST_1_0_0"],
+             None, None, 1, 1, "US:en", None, 1, None, None, None,
+             None, None, 0, 1],
+            "en-US", "US", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0
+        ]],
+        article_id,
+        timestamp,
+        signature,
+    ]
+
+    outer = [[[
+        "Fbv4je",
+        json.dumps(inner, separators=(",", ":")),
+        None,
+        "generic",
+    ]]]
+
+    return "f.req=" + quote(
+        json.dumps(outer, separators=(",", ":")),
+        safe="",
+    )
+
+
+def _build_rpc_legacy_unsigned(article_id: str) -> str:
+    inner = [
+        "garturlreq",
+        [[
+            [["en-US", "US", ["FINANCE_TOP_INDICES", "WEB_TEST_1_0_0"],
+              None, None, 1, 1, "US:en", None, 1, None, None,
+              None, None, None, 0, 1],
+             "en-US", "US", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0]
+        ]],
+        article_id,
+    ]
+
+    outer = [[[
+        "Fbv4je",
+        json.dumps(inner, separators=(",", ":")),
+        None,
+        "generic",
+    ]]]
+
+    return "f.req=" + quote(
+        json.dumps(outer, separators=(",", ":")),
+        safe="",
+    )
+
+
+def _post_rpc(body: str, cookies: dict[str, str] | None = None) -> str:
+    response = cffi_requests.post(
+        BATCHEXECUTE_URL,
+        data=body,
+        cookies=cookies or {},
+        impersonate="chrome124",
+        timeout=HTTP_TIMEOUT,
+        allow_redirects=True,
+        proxies=_proxy(),
+        headers={
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "Referer": "https://news.google.com/",
+            "Origin": "https://news.google.com",
+            "Accept": "*/*",
+        },
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"batchexecute HTTP {response.status_code}")
+    return response.text
+
+
+def _extract_url_deep(obj: Any) -> str | None:
+    """Recursively locate garturlres and validate its URL."""
+    if isinstance(obj, dict):
+        for value in obj.values():
+            found = _extract_url_deep(value)
+            if found:
+                return found
+        return None
+
+    if isinstance(obj, list):
+        # garturlres is generally [name, url, ...]
+        if len(obj) >= 2 and obj[0] == "garturlres":
+            target = _clean_url(obj[1])
+            if target:
+                return target
+
+        for item in obj:
+            found = _extract_url_deep(item)
+            if found:
+                return found
+
+    return None
+
+
+def _parse_rpc_response(text: str) -> str | None:
+    """
+    Google wraps batchexecute responses in one or more JSON-ish frames.
+    Do not depend on one exact line number or '\\n\\n' position.
+    """
+    # Fast path: escaped garturlres.
+    for pattern in (
+        r'\[\\"garturlres\\",\\"(https?://[^"\\]+)',
+        r'garturlres\\\\?["\']\s*,\s*\\\\?["\'](https?://[^"\\]+)',
+    ):
+        for m in re.finditer(pattern, text, re.I):
+            target = _clean_url(m.group(1))
+            if target:
+                return target
+
+    # Decode every plausible JSON fragment beginning with '['.
+    starts = [m.start() for m in re.finditer(r"\[", text)]
+    for start in starts[:80]:
+        fragment = text[start:].strip()
+        try:
+            obj = json.loads(fragment)
+        except Exception:
+            continue
+        target = _extract_url_deep(obj)
         if target:
-            return target, "html-payload"
+            return target
+
+    # Last structured fallback: extract URLs, but ONLY accept non-Google
+    # publisher URLs. This prevents the lh3.googleusercontent.com bug.
+    for candidate in re.findall(r"https?://[^\s\"'\\<>\]\[(),]+", text):
+        target = _clean_url(candidate)
+        if target:
+            return target
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# HTML strategy
+# ---------------------------------------------------------------------------
+
+def _html_target_candidates(html: str):
+    """
+    Extract only plausible publisher candidates. In particular, never use
+    'first external URL' because Google's page contains lh3/gstatic URLs.
+    """
+    # Known Google redirect attributes.
+    for attr in ("data-n-a-uc", "data-n-au"):
+        for pattern in (
+            rf'\b{re.escape(attr)}\s*=\s*"([^"]+)"',
+            rf"\b{re.escape(attr)}\s*=\s*'([^']+)'",
+        ):
+            for m in re.finditer(pattern, html, re.I):
+                target = _clean_url(m.group(1))
+                if target:
+                    yield target
+
+    # Search for publisher-looking URLs near article metadata. This is only
+    # a fallback; arbitrary first external URLs are deliberately not used.
+    for pattern in (
+        r'"(?:url|target|destination|articleUrl|sourceUrl)"\s*:\s*"([^"]+)"',
+        r"'(?:url|target|destination|articleUrl|sourceUrl)'\s*:\s*'([^']+)'",
+    ):
+        for m in re.finditer(pattern, html, re.I):
+            target = _clean_url(m.group(1))
+            if target:
+                yield target
+
+
+async def _resolve_html(url: str):
+    try:
+        response = await asyncio.to_thread(_get_page, url)
+        if not response:
+            return None, "html-no-response", None
+
+        html = response.text
+        params = _extract_current_params(html, _article_id(url) or "")
+
+        # A real HTTP redirect is useful only if it actually leaves Google.
+        final = str(getattr(response, "url", "") or "")
+        if _is_publisher_url(final):
+            return final, "http-redirect", params
+
+        for target in _html_target_candidates(html):
+            return target, "html-target", params
+
+        return None, "html-no-target", params
     except Exception as exc:
-        logger.debug("HTML resolver failed: %s", exc)
-    return None, "html-failed"
+        log.debug("HTML resolution failed: %s", exc)
+        return None, f"html-error:{type(exc).__name__}", None
 
 
-# ---------- Strategy 3: Playwright ----------
+# ---------------------------------------------------------------------------
+# RPC strategy
+# ---------------------------------------------------------------------------
+
+async def _resolve_rpc(url: str, params: dict[str, Any] | None):
+    global _last_rpc
+
+    if not params:
+        return None, "rpc-no-params"
+
+    article_id = params.get("id") or _article_id(url)
+    if not article_id:
+        return None, "rpc-no-article-id"
+
+    bodies: list[tuple[str, str]] = []
+
+    # Most important: Google's current data-p payload.
+    data_p = params.get("data_p")
+    if data_p:
+        body = _build_rpc_from_data_p(data_p)
+        if body:
+            bodies.append(("batchexecute-data-p", body))
+
+    # Next: current data-n-a-id + signature + timestamp.
+    ts = params.get("timestamp")
+    sig = params.get("signature")
+    if ts and sig:
+        bodies.append((
+            "batchexecute-signature",
+            _build_rpc_legacy(article_id, str(ts), str(sig)),
+        ))
+
+    # Final unsigned shape used by older links.
+    bodies.append(("batchexecute-unsigned", _build_rpc_legacy_unsigned(article_id)))
+
+    async with _rpc_lock:
+        delay = _last_rpc + MIN_RPC_INTERVAL - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        _last_rpc = time.monotonic()
+
+        last_error = "rpc-failed"
+
+        for method, body in bodies:
+            try:
+                # Re-fetch cookies immediately before RPC when possible.
+                page_response = await asyncio.to_thread(_get_page, url)
+                cookies = {}
+                if page_response is not None:
+                    try:
+                        cookies = dict(page_response.cookies)
+                    except Exception:
+                        cookies = {}
+
+                text = await asyncio.to_thread(_post_rpc, body, cookies)
+                target = _parse_rpc_response(text)
+                if target:
+                    return target, method
+                last_error = method + ":no-garturlres"
+            except Exception as exc:
+                last_error = f"{method}:{type(exc).__name__}"
+                log.debug("RPC attempt failed: %s", exc)
+
+        return None, last_error
+
+
+# ---------------------------------------------------------------------------
+# Browser fallback
+# ---------------------------------------------------------------------------
+
 async def _create_browser():
+    if async_playwright is None:
+        raise RuntimeError("Playwright is not installed")
     return await _playwright.chromium.launch(
         headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+        ],
     )
 
 
 async def _ensure_browser_pool():
     global _playwright, _browser_pool
+
     if _browser_pool is not None:
         return
-    async with _browser_start_lock:
+
+    async with _browser_lock:
         if _browser_pool is not None:
             return
+
+        if async_playwright is None:
+            raise RuntimeError("Playwright is not installed")
+
         _playwright = await async_playwright().start()
         _browser_pool = asyncio.Queue(maxsize=BROWSER_POOL_SIZE)
+
         for _ in range(BROWSER_POOL_SIZE):
             await _browser_pool.put(await _create_browser())
-        logger.info("Google News Playwright pool ready: %s browsers", BROWSER_POOL_SIZE)
 
 
 @asynccontextmanager
-async def _get_browser():
+async def _browser():
     await _ensure_browser_pool()
     browser = await _browser_pool.get()
     try:
         if not browser.is_connected():
-            try:
-                await browser.close()
-            except Exception:
-                pass
             browser = await _create_browser()
         yield browser
     finally:
@@ -246,172 +748,70 @@ async def _get_browser():
             pass
 
 
-async def _playwright_resolve(url: str):
+async def _resolve_browser(url: str):
     try:
-        async with _get_browser() as browser:
-            page = await browser.new_page(
+        async with _browser() as browser:
+            context = await browser.new_context(
                 locale="en-US",
-                viewport={"width": 1280, "height": 720},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
+                user_agent=USER_AGENT,
+                java_script_enabled=True,
             )
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT_MS)
+            page = await context.new_page()
 
-                selectors = [
-                    'button:has-text("Accept all")',
-                    'button:has-text("I agree")',
-                    'text="Accept all"',
-                    'text="Zaakceptuj wszystko"',
-                    'text="Akceptuj wszystko"',
-                ]
-                for selector in selectors:
-                    try:
-                        btn = await page.wait_for_selector(selector, timeout=400)
-                        if btn:
-                            await btn.click(timeout=1000)
-                            await page.wait_for_timeout(300)
-                            break
-                    except (PlaywrightTimeoutError, Exception):
-                        continue
+            try:
+                await page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=BROWSER_TIMEOUT_MS,
+                )
 
                 started = time.monotonic()
-                while time.monotonic() - started < PLAYWRIGHT_REDIRECT_WAIT_MS / 1000:
+
+                while (time.monotonic() - started) < (BROWSER_WAIT_MS / 1000):
                     current = page.url
-                    if _is_external(current):
+                    if _is_publisher_url(current):
                         return current, "playwright"
-                    await page.wait_for_timeout(250)
+
+                    # Google's redirect page can contain the destination in
+                    # dynamically-created attributes.
+                    try:
+                        html = await page.content()
+                        for target in _html_target_candidates(html):
+                            return target, "playwright-html"
+                    except Exception:
+                        pass
+
+                    await page.wait_for_timeout(200)
 
                 current = page.url
-                if _is_external(current):
-                    return current, "playwright"
+                if _is_publisher_url(current):
+                    return current, "playwright-final"
 
-                # Inspect page HTML after JS has run.
-                try:
-                    target = _extract_html_target(await page.content())
-                    if target:
-                        return target, "playwright-html"
-                except Exception:
-                    pass
+                return None, "playwright-no-target"
+
             finally:
-                await page.close()
+                await context.close()
+
     except Exception as exc:
-        logger.warning("Playwright Google News resolver failed: %s", exc)
-    return None, "playwright-failed"
+        log.debug("Playwright resolution failed: %s", exc)
+        return None, f"playwright-error:{type(exc).__name__}"
 
 
-# ---------- Strategy 4: batchexecute ----------
-def _build_freq(gn_art_id: str, sig: str = "", ts: str = "") -> str:
-    inner_req = [
-        "garturlreq",
-        [[
-            [["en-US", "US", ["FINANCE_TOP_INDICES", "WEB_TEST_1_0_0"], None,
-              None, 1, 1, "US:en", None, 180, None, None, None, None, 0,
-              None, None, [1608992183, 723341000]],
-             "en-US", "US", 1, [2, 3, 4, 8], 1, 0, "655000234", 0, 0,
-             None, 0]
-        ]],
-        gn_art_id,
-    ]
-    if sig and ts:
-        inner_req += [ts, sig, False]
-    freq = json.dumps([[['Fbv4je', json.dumps(inner_req), None, 'generic']]])
-    return "f.req=" + quote(freq)
-
-
-def _parse_garturlres(text: str) -> str | None:
-    try:
-        payload = text[text.index("["):]
-        data = json.loads(payload)
-        for row in data:
-            try:
-                inner = json.loads(row[2])
-                if (isinstance(inner, list) and len(inner) > 1
-                        and inner[0] == "garturlres"
-                        and isinstance(inner[1], str)):
-                    target = _clean_candidate(inner[1])
-                    if target and _is_external(target):
-                        return target
-            except (json.JSONDecodeError, TypeError, IndexError, ValueError):
-                continue
-    except (ValueError, json.JSONDecodeError, TypeError):
-        pass
-    m = re.search(r'garturlres\\",\\"(https?://[^\\",]+)', text)
-    if m:
-        target = _clean_candidate(m.group(1))
-        return target if target and _is_external(target) else None
-    return None
-
-
-def _is_retryable(exc):
-    msg = str(exc).lower()
-    return any(x in msg for x in ("timeout", "429", "rate", "too many", "500", "502", "503"))
-
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=5),
-    retry=retry_if_exception(_is_retryable),
-    reraise=True,
-)
-def _post_batchexecute(body: str, cookies: dict) -> str:
-    r = cffi_requests.post(
-        _BATCHEXECUTE_URL,
-        data=body,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-            "Referer": "https://news.google.com/",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        },
-        cookies=cookies,
-        impersonate="chrome124",
-        timeout=15,
-        allow_redirects=True,
-        proxies=_proxy_dict(),
-    )
-    if r.status_code != 200:
-        raise RuntimeError(f"batchexecute HTTP {r.status_code}")
-    return r.text
-
-
-async def _batchexecute_resolve(url: str, b64: str):
-    global _LAST_CALL_TS
-    sig = ts = ""
-    cookies = {}
-    try:
-        response = await asyncio.to_thread(_get_redirect_page, url)
-        html = response.text
-        cookies = response.cookies
-        m_sig = re.search(r'data-n-a-sg="([^"]*)"', html)
-        m_ts = re.search(r'data-n-a-ts="([^"]*)"', html)
-        sig = m_sig.group(1) if m_sig else ""
-        ts = m_ts.group(1) if m_ts else ""
-    except Exception:
-        pass
-
-    async with _LOCK:
-        delay = _LAST_CALL_TS + _MIN_INTERVAL_S - time.monotonic()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        _LAST_CALL_TS = time.monotonic()
-        attempts = []
-        if sig and ts:
-            attempts.append(("batchexecute+sig", _build_freq(b64, sig, ts)))
-        attempts.append(("batchexecute-legacy", _build_freq(b64)))
-        last_err = "batchexecute-failed"
-        for method, body in attempts:
-            try:
-                text = await asyncio.to_thread(_post_batchexecute, body, cookies)
-                target = _parse_garturlres(text)
-                if target:
-                    return target, method
-                last_err = f"{method}:no-garturlres"
-            except Exception as exc:
-                last_err = f"{method}:{type(exc).__name__}"
-        return None, last_err
-
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 async def resolve_google_news(url: str) -> tuple[str | None, str]:
-    """Return ``(publisher_url, method)``. Non-Google-News URLs pass through."""
+    """
+    Resolve a Google News URL.
+
+    Returns:
+        (publisher_url, method)
+
+    For a non-Google URL, returns (url, "not-a-gnews-url").
+    For an unresolved Google URL, returns (None, failure_method).
+    """
     if not is_google_news_url(url):
         return url, "not-a-gnews-url"
 
@@ -419,47 +819,47 @@ async def resolve_google_news(url: str) -> tuple[str | None, str]:
     if cached:
         return cached, "cache"
 
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-    if qs.get("url"):
-        direct = _clean_candidate(qs["url"][0])
-        if direct and _is_external(direct):
-            _cache_put(url, direct)
-            return direct, "url-param"
+    # Explicit URL parameter.
+    try:
+        qs = parse_qs(urlparse(url).query)
+        for value in qs.get("url", []):
+            target = _clean_url(value)
+            if target:
+                _cache_put(url, target)
+                return target, "url-param"
+    except Exception:
+        pass
 
-    b64 = parsed.path.rstrip("/").rsplit("/", 1)[-1]
-    if not b64:
+    article_id = _article_id(url)
+    if not article_id:
         return None, "no-article-id"
 
-    offline = _decode_offline(b64)
-    if offline:
-        _cache_put(url, offline)
-        return offline, "b64-decode"
+    # Old-format links can still be decoded locally.
+    target = _decode_legacy_base64(article_id)
+    if target:
+        _cache_put(url, target)
+        return target, "legacy-base64"
 
-    # The supplied JS fallback is cheap, so use it before launching Chromium.
-    target, method = await _html_resolve(url)
+    # Current Google page + current RPC.
+    _, html_method, params = await _resolve_html(url)
+
+    target, method = await _resolve_rpc(url, params)
     if target:
         _cache_put(url, target)
         return target, method
 
-    # Browser fallback for redirects that require JavaScript/cookies/consent.
-    target, method = await _playwright_resolve(url)
+    # Browser is deliberately after RPC. It is slower and consumes more RAM.
+    target, method = await _resolve_browser(url)
     if target:
         _cache_put(url, target)
         return target, method
 
-    # Final RPC fallback.
-    target, method = await _batchexecute_resolve(url, b64)
-    if target:
-        _cache_put(url, target)
-        return target, method
-
-    return None, method
+    return None, method or html_method or "not-resolved"
 
 
 async def shutdown_resolver():
-    """Close Playwright resources during application shutdown."""
     global _playwright, _browser_pool
+
     if _browser_pool is not None:
         while not _browser_pool.empty():
             try:
@@ -467,10 +867,20 @@ async def shutdown_resolver():
                 await browser.close()
             except Exception:
                 pass
+
     _browser_pool = None
+
     if _playwright is not None:
         try:
             await _playwright.stop()
         except Exception:
             pass
+
     _playwright = None
+
+
+__all__ = [
+    "is_google_news_url",
+    "resolve_google_news",
+    "shutdown_resolver",
+]
