@@ -1,17 +1,37 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
+
+# Install system dependencies for Playwright
+RUN apt-get update && apt-get install -y \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libxss1 \
+    libasound2 \
+    ca-certificates \
+    fonts-liberation \
+    libcups2 \
+    libxfixes3 \
+    libpango-1.0-0 \
+    libcairo2 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the entire source code (including gnews_resolver.py and config.py)
+# Install Playwright's Chromium
+RUN playwright install chromium
+
+# Copy the application code
 COPY . .
 
+# Create non-root user
 RUN useradd --create-home --uid 1000 user && chown -R user:user /app
 USER user
 
