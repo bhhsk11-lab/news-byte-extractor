@@ -1,21 +1,16 @@
-﻿"""
+"""
 Google News redirect-URL resolver.
 
-news.google.com/rss/articles/CBMi...?oc=5 URLs are protobuf-encoded
-click-tracking redirects, NOT real article URLs. Resolution strategy:
+Hybrid strategy:
+  1. Direct 'url=' query parameter (fast).
+  2. Offline base64/protobuf decode (old-style IDs).
+  3. batchexecute RPC (requires proxy, often rate‑limited).
+  4. Playwright browser fallback (reliable, no proxy needed).
 
-  1. Direct 'url=' query parameter (some redirects include it).
-  2. Offline base64/protobuf decode (old‑style IDs embed the URL).
-  3. batchexecute RPC (Fbv4je / garturlreq) with signature+timestamp
-     scraped from the redirect page — required for new‑style AU_yqL
-     IDs (July 2024+).
-  4. batchexecute without sig/ts (legacy fallback).
-
-Google rate‑limits batchexecute hard from datacenter IPs (429s), so all
-calls route through PROXY_URL when configured, results are LRU‑cached,
-and calls are serialized with a minimum interval. Retries are implemented
-for transient errors.
+Playwright uses a pooled browser to load the redirect page, click consent,
+and follow the redirect to the real publisher URL.
 """
+
 import asyncio
 import base64
 import json
@@ -27,31 +22,33 @@ from urllib.parse import parse_qs, urlparse
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 from curl_cffi import requests as cffi_requests
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 from config import settings
 
 logger = logging.getLogger("gnews-resolver")
 
+# ── batchexecute constants ──────────────────────────────────────────
 _BATCHEXECUTE_URL = "https://news.google.com/_/DotsSplashUi/data/batchexecute?rpcids=Fbv4je"
-
-# ── LRU cache for resolved URLs ──────────────────────────────────────
 _RESOLVE_CACHE_MAX = 2000
 _resolve_cache: OrderedDict = OrderedDict()
-
-# Serialize batchexecute calls + politeness delay (429 hotspot)
 _resolve_lock = asyncio.Lock()
 _last_call_ts = 0.0
 _MIN_INTERVAL_S = 0.75
 
+# ── Playwright browser pool ─────────────────────────────────────────
+_BROWSER_POOL_SIZE = 3          # adjust based on your instance memory
+_browser_pool: asyncio.Queue = None
+_playwright_instance = None
+_PW_INITIALIZED = False
+
 
 def is_google_news_url(url: str) -> bool:
-    """Check if the URL is a Google News redirect (rss/articles/...)."""
     try:
         parsed = urlparse(url)
         host = parsed.hostname or ""
     except Exception:
         return False
-    # Some URLs may have host as news.google.com or subdomains
     return host == "news.google.com" or host.endswith(".news.google.com")
 
 
@@ -75,7 +72,7 @@ def _proxies() -> dict | None:
     return None
 
 
-# ── Strategy 1: offline protobuf base64 decode (old‑style IDs) ──────
+# ── Offline decode (old IDs) ────────────────────────────────────────
 def _decode_offline(b64: str) -> str | None:
     try:
         s = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
@@ -99,15 +96,9 @@ def _decode_offline(b64: str) -> str | None:
     return out if out.startswith("http") else None
 
 
-# ── batchexecute plumbing ────────────────────────────────────────────
+# ── batchexecute RPC (legacy) ──────────────────────────────────────
 def _build_freq(gn_art_id: str, sig: str = "", ts: str = "") -> str:
-    """
-    Build the URL‑encoded f.req body for the Fbv4je 'garturlreq' RPC.
-
-    Structure is based on traffic captured from news.google.com in Chrome.
-    The nested list layout is critical for the server to accept the request.
-    """
-    # The base request structure
+    from urllib.parse import quote
     inner_req = [
         "garturlreq",
         [
@@ -123,18 +114,11 @@ def _build_freq(gn_art_id: str, sig: str = "", ts: str = "") -> str:
     ]
     if sig and ts:
         inner_req += [ts, sig, False]
-    # The outer wrapper: [ [ [ RPC_ID, JSON_string, None, "generic" ] ] ]
     freq = json.dumps([[["Fbv4je", json.dumps(inner_req), None, "generic"]]])
-    # URL‑encode the whole thing as 'f.req=...'
     return "f.req=" + quote(freq)
 
 
-# We need urllib.parse.quote for the encoding
-from urllib.parse import quote
-
-
 def _get_redirect_page(url: str):
-    """Fetch the redirect page and return (html, cookies)."""
     r = cffi_requests.get(
         url,
         impersonate="chrome124",
@@ -151,16 +135,12 @@ def _get_redirect_page(url: str):
 
 
 def _parse_garturlres(text: str) -> str | None:
-    """Extract the resolved URL from a batchexecute response."""
     try:
-        # The response is a JSON with a leading `)]}'` sometimes
         payload = text[text.index("["):]
         data = json.loads(payload)
-        # data is typically a list of lists
         for row in data:
             try:
-                # The third element is a JSON string containing the actual result
-                inner = json.loads(row[2])  # row[2] is the string
+                inner = json.loads(row[2])
                 if (isinstance(inner, list) and len(inner) > 1
                         and inner[0] == "garturlres"
                         and isinstance(inner[1], str)
@@ -170,14 +150,11 @@ def _parse_garturlres(text: str) -> str | None:
                 continue
     except (ValueError, json.JSONDecodeError):
         pass
-    # Fallback regex in case parsing fails
     m = re.search(r'garturlres\\",\\"(https?://[^\\",]+)', text)
     return m.group(1) if m else None
 
 
-# Retry decorator for batchexecute (transient errors)
 def _is_retryable(exception):
-    """Return True if we should retry the batchexecute call."""
     if isinstance(exception, Exception):
         msg = str(exception).lower()
         return any(x in msg for x in ("timeout", "429", "rate", "too many", "500", "502", "503"))
@@ -191,7 +168,6 @@ def _is_retryable(exception):
     reraise=True,
 )
 def _post_batchexecute(freq_body: str, cookies: dict) -> str:
-    """Make the batchexecute POST request with retries."""
     r = cffi_requests.post(
         _BATCHEXECUTE_URL,
         data=freq_body,
@@ -211,12 +187,118 @@ def _post_batchexecute(freq_body: str, cookies: dict) -> str:
     return r.text
 
 
+# ── Playwright fallback resolver ────────────────────────────────────
+async def _resolve_with_playwright(url: str, timeout: int = 20) -> str | None:
+    """
+    Use a real browser to load the Google News redirect page,
+    click consent if needed, and follow the redirect to the publisher URL.
+    Returns the final URL, or None on failure.
+    """
+    global _browser_pool, _playwright_instance, _PW_INITIALIZED
+
+    if not _PW_INITIALIZED:
+        logger.warning("Playwright not initialized – cannot use browser fallback")
+        return None
+
+    browser = await _browser_pool.get()
+    page = None
+    try:
+        if not browser.is_connected():
+            logger.warning("Browser disconnected – recreating")
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            browser = await _playwright_instance.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            )
+
+        page = await browser.new_page(
+            locale="en-US",
+            viewport={"width": 1280, "height": 720},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
+
+        # Navigate with a timeout
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        except PlaywrightTimeoutError:
+            logger.warning(f"Playwright goto timeout for {url}")
+            return None
+
+        # Try to click "Accept all" consent button (common on Google News)
+        consent_selectors = [
+            'text="Zaakceptuj wszystko"',
+            'text="Akceptuj wszystko"',
+            'button:has-text("Zaakceptuj wszystko")',
+            'text="Accept all"',
+            'button:has-text("Accept all")',
+            'button:has-text("Accept All")',
+        ]
+        clicked = False
+        for selector in consent_selectors:
+            try:
+                btn = await page.wait_for_selector(selector, timeout=500)
+                if btn:
+                    await asyncio.gather(
+                        page.wait_for_load_state("domcontentloaded", timeout=5000),
+                        btn.click(timeout=1000),
+                    )
+                    clicked = True
+                    logger.info(f"Consent clicked with selector: {selector}")
+                    break
+            except (PlaywrightTimeoutError, Exception):
+                continue
+
+        # Wait for redirection away from google.com
+        start = time.time()
+        while time.time() - start < 8:  # wait up to 8 seconds for redirect
+            current_url = page.url
+            if "google.com" not in current_url:
+                final_url = current_url
+                await page.close()
+                await _browser_pool.put(browser)
+                return final_url
+            await page.wait_for_timeout(300)
+
+        # If still on google.com, try to extract from page source as fallback
+        html = await page.content()
+        # Look for data-n-a-uc or data-n-au attributes
+        m = re.search(r'data-n-a-uc="([^"]+)"', html) or re.search(r'data-n-au="([^"]+)"', html)
+        if m:
+            extracted = m.group(1)
+            if extracted.startswith("http"):
+                await page.close()
+                await _browser_pool.put(browser)
+                return extracted
+
+        # If nothing found, return the current URL (may still be google.com)
+        final_url = page.url
+        await page.close()
+        await _browser_pool.put(browser)
+        return final_url if "google.com" not in final_url else None
+
+    except Exception as e:
+        logger.warning(f"Playwright resolver error for {url}: {e}")
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        # Put browser back even on error
+        try:
+            await _browser_pool.put(browser)
+        except Exception:
+            pass
+        return None
+
+
+# ── Public interface ──────────────────────────────────────────────
 async def resolve_google_news(url: str) -> tuple[str | None, str]:
-    """
-    Resolve a Google News redirect URL to the original publisher URL.
-    Returns (resolved_url, method_or_error). resolved_url is None on failure.
-    Non‑Google‑News URLs pass through unchanged.
-    """
     if not is_google_news_url(url):
         return url, "not-a-gnews-url"
 
@@ -224,7 +306,7 @@ async def resolve_google_news(url: str) -> tuple[str | None, str]:
     if cached:
         return cached, "cache"
 
-    # ── Fast path: extract direct 'url=' parameter ──────────────────
+    # 1. Fast path: direct 'url=' parameter
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
     if "url" in qs and qs["url"][0].startswith("http"):
@@ -232,48 +314,41 @@ async def resolve_google_news(url: str) -> tuple[str | None, str]:
         _cache_put(url, direct)
         return direct, "url-param"
 
-    global _last_call_ts
-
-    # ── Extract article ID from path ────────────────────────────────
     path = parsed.path.rstrip("/")
     b64 = path.rsplit("/", 1)[-1]
     if not b64:
         return None, "no-article-id"
 
-    # ── Offline decode (works for older IDs) ────────────────────────
+    # 2. Offline decode
     offline = _decode_offline(b64)
     if offline:
         _cache_put(url, offline)
         return offline, "b64-decode"
 
-    # ── Fetch redirect page to get sig/ts and cookies ──────────────
+    # 3. batchexecute (try with sig/ts if possible)
     sig = ts = ""
     cookies = {}
     try:
         html, cookies = await asyncio.to_thread(_get_redirect_page, url)
-        # Extract data-n-a-sg and data-n-a-ts
         m_sig = re.search(r'data-n-a-sg="([^"]*)"', html)
         m_ts = re.search(r'data-n-a-ts="([^"]*)"', html)
         sig = m_sig.group(1) if m_sig else ""
         ts = m_ts.group(1) if m_ts else ""
-        logger.debug(f"Extracted sig={sig[:10]}..., ts={ts}")
     except Exception as e:
-        logger.warning(f"Failed to fetch redirect page: {e}")
+        logger.debug(f"Failed to fetch redirect page for batchexecute: {e}")
 
-    # ── Serialize calls to avoid hitting rate limits ────────────────
+    global _last_call_ts
     async with _resolve_lock:
         wait = _last_call_ts + _MIN_INTERVAL_S - time.monotonic()
         if wait > 0:
             await asyncio.sleep(wait)
         _last_call_ts = time.monotonic()
 
-        # Build two attempts: with sig/ts, then without
         attempts = []
         if sig and ts:
             attempts.append(("batchexecute+sig", _build_freq(b64, sig, ts)))
         attempts.append(("batchexecute-legacy", _build_freq(b64)))
 
-        last_err = "unknown"
         for method, body in attempts:
             try:
                 resp = await asyncio.to_thread(_post_batchexecute, body, cookies)
@@ -281,8 +356,49 @@ async def resolve_google_news(url: str) -> tuple[str | None, str]:
                 if resolved:
                     _cache_put(url, resolved)
                     return resolved, method
-                last_err = f"no garturlres (resp len={len(resp)})"
             except Exception as e:
-                last_err = f"{type(e).__name__}: {str(e)[:120]}"
-                logger.warning(f"batchexecute {method} failed: {last_err}")
-        return None, last_err
+                logger.warning(f"batchexecute {method} failed: {e}")
+
+    # 4. Playwright fallback (browser)
+    logger.info(f"batchexecute failed, trying Playwright fallback for {url}")
+    resolved = await _resolve_with_playwright(url)
+    if resolved:
+        _cache_put(url, resolved)
+        return resolved, "playwright"
+    return None, "playwright-failed"
+
+
+# ── Lifecycle management (called from app.py) ──────────────────────
+async def init_playwright_pool(pool_size: int = 3):
+    """Initialize the Playwright browser pool. Call this on app startup."""
+    global _playwright_instance, _browser_pool, _PW_INITIALIZED
+    if _PW_INITIALIZED:
+        return
+    _playwright_instance = await async_playwright().start()
+    _browser_pool = asyncio.Queue(maxsize=pool_size)
+    for _ in range(pool_size):
+        browser = await _playwright_instance.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        )
+        await _browser_pool.put(browser)
+    _PW_INITIALIZED = True
+    logger.info(f"Playwright pool of {pool_size} browsers initialized")
+
+
+async def shutdown_playwright_pool():
+    """Clean up the browser pool. Call on app shutdown."""
+    global _playwright_instance, _browser_pool, _PW_INITIALIZED
+    if not _PW_INITIALIZED:
+        return
+    if _browser_pool:
+        while not _browser_pool.empty():
+            try:
+                browser = _browser_pool.get_nowait()
+                await browser.close()
+            except Exception:
+                pass
+    if _playwright_instance:
+        await _playwright_instance.stop()
+    _PW_INITIALIZED = False
+    logger.info("Playwright pool shut down")
