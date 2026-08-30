@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
 # Import the new Google News resolver
-from gnews_resolver import resolve_google_news as gnews_resolve, shutdown_resolver
+from scraper.gnews_resolver import resolve_google_news as gnews_resolve, shutdown_resolver
 
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
@@ -536,9 +536,13 @@ async def extract_one(url: str, render: bool, max_chars: int):
     # Resolve Google News URLs
     resolved_url, resolve_method = await resolve_google_news_url(url)
     url = resolved_url
-    if resolve_method and resolve_method not in ("cache", "not-resolved"):
-        errors.append("google-resolve:" + resolve_method)
-        # If still a Google News URL, fail fast
+
+    # A successful resolver method is NOT an error.  The previous code added
+    # every method (including "googlenewsdecoder" and "batchexecute-*") to
+    # errors, which made successful resolutions look like failures.
+    if is_google_news_article_url(url):
+        errors.append("google-resolve:" + (resolve_method or "not-resolved"))
+        # Only fail fast when the resolver actually left us on Google News.
         if is_google_news_article_url(url):
             return {
                 "ok": False,
