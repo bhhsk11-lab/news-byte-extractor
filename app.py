@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
 # Import the new Google News resolver
-from scraper.gnews_resolver import resolve_google_news as gnews_resolve, shutdown_resolver
+from gnews_resolver import resolve_google_news as gnews_resolve, shutdown_resolver
 
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
