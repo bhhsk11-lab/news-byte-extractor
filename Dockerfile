@@ -1,6 +1,8 @@
 FROM python:3.11-slim
 
 WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
 
 # Install system dependencies for Playwright
 RUN apt-get update && apt-get install -y \
@@ -22,19 +24,10 @@ RUN apt-get update && apt-get install -y \
     libcairo2 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Install Playwright's Chromium
 RUN playwright install chromium
 
-# Copy the application code
-COPY . .
-
-# Create non-root user
-RUN useradd --create-home --uid 1000 user && chown -R user:user /app
-USER user
+COPY app.py .
+COPY gnews_resolver.py .
 
 EXPOSE 8000
-
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
