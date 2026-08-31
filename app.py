@@ -42,11 +42,14 @@ EXTRACT_DEADLINE = 0  # retained for compatibility; /extract does not abort the 
 MIN_GOOD_WORDS = 120
 MIN_GOOD_SCORE = 0.30
 
-# Strict extraction serialization: only ONE /extract job may execute at a time.
-# A request keeps the lock for its complete Google-resolution + article-extraction
-# pipeline. The next request starts only after the previous response is ready.
-# This prevents concurrent Chromium/RPC/extraction load from piling up.
-EXTRACT_SERIAL_LOCK = asyncio.Lock()
+# Bounded extraction parallelism: up to TWO /extract jobs may execute at once.
+# A request holds a slot for its complete Google-resolution + article-extraction
+# pipeline. A third request queues until one of the two in-flight jobs finishes.
+# This still caps concurrent Chromium/RPC/extraction load (the resolver's own
+# internal semaphores, e.g. browser_page_sem=2, further bound Chromium usage),
+# while letting two items make progress instead of fully serializing.
+EXTRACT_CONCURRENCY = 2
+EXTRACT_SEM = asyncio.Semaphore(EXTRACT_CONCURRENCY)
 
 # Google News RSS article links are encoded Google redirect URLs, not publisher
 # article URLs. Keep a small in-process cache to avoid resolving the same link
@@ -1101,16 +1104,17 @@ async def resolve_google_batch_endpoint(request: dict):
 
 @app.post("/extract")
 async def extract_endpoint(request: ExtractRequest):
-    # Strictly serialize the COMPLETE extraction pipeline. Request N+1 does
-    # not start until request N has finished resolving/extracting and its
-    # response object has been produced.
-    async with EXTRACT_SERIAL_LOCK:
+    # Run up to EXTRACT_CONCURRENCY (2) COMPLETE extraction pipelines at once.
+    # A third/fourth/... request waits for a free slot rather than running
+    # fully unbounded, and rather than waiting for every prior request to
+    # finish one-by-one as the old single-lock version did.
+    async with EXTRACT_SEM:
         result = await extract_one(
             str(request.url),
             request.render,
             min(max(request.max_chars, 1000), 100000),
         )
-        result["server_queue_mode"] = "serial-1"
+        result["server_queue_mode"] = f"parallel-{EXTRACT_CONCURRENCY}"
         return result
 
 

@@ -4,4 +4,4 @@ Google News is resolved before extraction. Server Chromium is the last-resort re
 
 
 ## Request scheduling
-`POST /extract` is strictly serialized with one in-process extraction lock. The next extraction starts only after the previous extraction has completed and its response object is ready. Google News Chromium fallback has a 30-second resolver budget; Playwright navigation timeout remains 0. Raw Google News URLs are never forwarded to the secondary/auth-bypass extractor.
+`POST /extract` allows up to 2 extraction pipelines to run concurrently (an in-process semaphore, `EXTRACT_CONCURRENCY = 2`). A 3rd+ request queues until one of the two in-flight jobs finishes and frees a slot. This is a change from the prior single-lock ("serial-1") behavior; response bodies now report `server_queue_mode: "parallel-2"`. Google News Chromium fallback has a 30-second resolver budget; Playwright navigation timeout remains 0. Raw Google News URLs are never forwarded to the secondary/auth-bypass extractor.
