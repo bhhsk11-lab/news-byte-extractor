@@ -8,52 +8,7 @@ from urllib.parse import urlparse, urljoin
 
 import httpx
 import trafilatura
-try:
-    from googlenewsdecoder import gnewsdecoder
-except Exception:
-    gnewsdecoder = None
-
-# googlenewsdecoder's internal GoogleDecoder makes its HTTP calls with the
-# plain `requests` library and NO headers at all on the first call
-# (get_decoding_params) — meaning it self-identifies as
-# "User-Agent: python-requests/x.x" to news.google.com, with no Referer.
-# A single isolated call like that often slips through, but the extension
-# resolves 15-20 of these back-to-back on every feed load; a burst of
-# identically-fingerprinted, headerless requests from one IP is a textbook
-# bot-detection trigger, which lines up with decode succeeding in isolation
-# (confirmed via manual testing) but failing near-100% during real usage.
-# The library gives no way to pass custom headers into get_decoding_params,
-# so wrap requests.get itself before it's used. This only affects
-# googlenewsdecoder's calls: it accesses `requests.get(...)` via qualified
-# attribute lookup (not `from requests import get`), so reassigning the
-# attribute on the module object is visible to it; this app otherwise
-# uses httpx exclusively, so nothing else in this file is affected.
-# (Not patching requests.utils.default_headers / Session header init: those
-# are bound into requests.sessions via `from .utils import default_headers`
-# at requests' own import time, so patching the utils module after the fact
-# has no effect on Session — verified against the installed requests
-# version before relying on this.)
-try:
-    import requests as _requests
-
-    _ORIGINAL_REQUESTS_GET = _requests.get
-    _DECODER_HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://news.google.com/",
-    }
-
-    def _requests_get_with_browser_headers(url, **kwargs):
-        headers = dict(_DECODER_HEADERS)
-        headers.update(kwargs.pop("headers", None) or {})
-        return _ORIGINAL_REQUESTS_GET(url, headers=headers, **kwargs)
-
-    _requests.get = _requests_get_with_browser_headers
-except Exception:
-    pass
+from google_resolver import resolver as google_resolver
 
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Response
@@ -63,7 +18,7 @@ from pydantic import BaseModel, HttpUrl
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
     description="Non-AI source article + site-structure extraction service for NEWS BYTE.",
-    version="1.4.0",
+    version="1.5.0",
 )
 
 # NEWS BYTE is a personal extension. CORS is open so the extension can call
@@ -89,67 +44,10 @@ MIN_GOOD_SCORE = 0.30
 # Google News RSS article links are encoded Google redirect URLs, not publisher
 # article URLs. Keep a small in-process cache to avoid resolving the same link
 # repeatedly during a feed refresh.
-GOOGLE_RESOLVE_CACHE = {}
-GOOGLE_RESOLVE_CACHE_MAX = 500
-# A feed refresh resolves 15-20 of these back to back. Each one is 1-2 plain,
-# identically-fingerprinted `requests` calls straight to news.google.com;
-# firing all of them at once from one IP is a plausible trigger for
-# short-lived soft-blocking (isolated manual calls succeed; bursts during
-# real usage were failing near-100%). Cap how many resolve concurrently so
-# they go out more like a browser tab-switching through a feed than a
-# scraper hammering an endpoint. (This was previously an unused
-# `asyncio.Lock()` here that nothing ever acquired — a semaphore of 3 keeps
-# some parallelism instead of fully serializing.)
-GOOGLE_RESOLVE_SEMAPHORE = asyncio.Semaphore(3)
-
-
-def is_google_news_article_url(url: str) -> bool:
-    try:
-        host = (urlparse(url).hostname or "").lower()
-        path = urlparse(url).path
-        return host == "news.google.com" and (
-            path.startswith("/rss/articles/") or path.startswith("/articles/") or path.startswith("/read/")
-        )
-    except Exception:
-        return False
-
-
 async def resolve_google_news_url(url: str):
-    """Resolve a Google News RSS redirect to the publisher URL."""
-    if not is_google_news_article_url(url):
-        return url, None
-
-    cached = GOOGLE_RESOLVE_CACHE.get(url)
-    if cached:
-        return cached, "cache"
-
-    if gnewsdecoder is None:
-        return url, "decoder-unavailable"
-
-    async with GOOGLE_RESOLVE_SEMAPHORE:
-        try:
-            # The decoder makes up to two sequential, un-timed `requests` calls
-            # to news.google.com internally (see GoogleDecoder.get_decoding_params
-            # / decode_url in the googlenewsdecoder package — neither passes a
-            # timeout=). If Google is slow, soft-blocking this IP, or has changed
-            # the markup the decoder scrapes for data-n-a-sg/data-n-a-ts, this
-            # can hang far longer than is worth waiting on before falling back
-            # to the second extractor. Cap it hard.
-            result = await asyncio.wait_for(
-                asyncio.to_thread(gnewsdecoder, url, interval=0), timeout=8.0
-            )
-            if isinstance(result, dict) and result.get("status") and result.get("decoded_url"):
-                resolved = str(result["decoded_url"])
-                if is_public_url(resolved):
-                    if len(GOOGLE_RESOLVE_CACHE) >= GOOGLE_RESOLVE_CACHE_MAX:
-                        GOOGLE_RESOLVE_CACHE.pop(next(iter(GOOGLE_RESOLVE_CACHE)))
-                    GOOGLE_RESOLVE_CACHE[url] = resolved
-                    return resolved, "googlenewsdecoder"
-            return url, "decoder-failed"
-        except asyncio.TimeoutError:
-            return url, "decoder-timeout"
-        except Exception as exc:
-            return url, "decoder-" + type(exc).__name__
+    """Resolve Google News URLs through the hardened resolver."""
+    result = await google_resolver.resolve(str(url))
+    return result.url, result.method if result.method != "failed" else "failed", result.error
 
 
 class ExtractRequest(BaseModel):
@@ -708,9 +606,11 @@ async def extract_one(url: str, render: bool, max_chars: int):
 
     # Google News RSS gives encoded /rss/articles/ URLs. They usually return a
     # Google interstitial to plain HTTP clients, so resolve them first.
-    resolved_url, resolve_method = await resolve_google_news_url(url)
+    resolved_url, resolve_method, resolve_error = await resolve_google_news_url(url)
     url = resolved_url
-    if resolve_method and resolve_method not in ("cache", "googlenewsdecoder"):
+    if resolve_method == "failed":
+        errors.append("google-resolve:" + (resolve_error or "failed"))
+    elif resolve_method and resolve_method not in ("cache", "passthrough"):
         errors.append("google-resolve:" + resolve_method)
         # If this was a Google News link and we still only have the raw
         # news.google.com redirect (not a publisher URL), fetch_html() below
@@ -719,13 +619,14 @@ async def extract_one(url: str, render: bool, max_chars: int):
         # rides along with google-resolve:decoder-failed in the logs. Don't
         # spend another ~10-20s httpx timeout finding that out; fail fast so
         # the extension can fail over to the second extractor sooner.
-        if is_google_news_article_url(url):
+        if google_resolver.is_google_url(url):
             return {
                 "ok": False,
                 "url": requested_url,
                 "requested_url": requested_url,
                 "resolved_url": url,
                 "google_resolve": resolve_method,
+                "google_resolve_error": resolve_error,
                 "title": "",
                 "author": "",
                 "published": "",
@@ -752,6 +653,7 @@ async def extract_one(url: str, render: bool, max_chars: int):
         result["requested_url"] = requested_url
         result["resolved_url"] = final_url
         result["google_resolve"] = resolve_method
+        result["google_resolve_error"] = resolve_error
         last_result = result
 
         if (
@@ -795,6 +697,7 @@ async def extract_one(url: str, render: bool, max_chars: int):
         "requested_url": requested_url,
         "resolved_url": url,
         "google_resolve": resolve_method,
+        "google_resolve_error": resolve_error,
         "title": "",
         "author": "",
         "published": "",
@@ -1163,7 +1066,27 @@ async def health():
         "ok": True,
         "service": "news-byte-source-extractor",
         "ai": False,
+        "google_resolver": "hardened",
     }
+
+
+@app.post("/resolve-google")
+async def resolve_google_endpoint(request: dict):
+    url = str(request.get("url", "")).strip()
+    if not url or not google_resolver.is_google_url(url):
+        return {"ok": True, "url": url, "resolved_url": url, "method": "passthrough"}
+    result = await google_resolver.resolve(url)
+    return {"ok": result.method != "failed", "url": url, "resolved_url": result.url,
+            "method": result.method, "error": result.error}
+
+
+@app.post("/resolve-google/batch")
+async def resolve_google_batch_endpoint(request: dict):
+    urls = request.get("urls") or []
+    if not isinstance(urls, list) or len(urls) > 50:
+        raise HTTPException(400, "urls must be a list of at most 50 URLs")
+    results = await google_resolver.resolve_many([str(x) for x in urls])
+    return {"results": [r.__dict__ for r in results]}
 
 
 @app.post("/extract")
@@ -1178,3 +1101,8 @@ async def extract_endpoint(request: ExtractRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=7860)
+
+
+@app.on_event("shutdown")
+async def shutdown_google_resolver():
+    await google_resolver.close()

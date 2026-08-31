@@ -1,16 +1,21 @@
-# NEWS BYTE Render Extractor 1.2
+# NEWS BYTE Source Extractor
 
-Fixes:
-- Trafilatura 2.2 `Document` handling.
-- Google News RSS `/rss/articles/...` links are resolved to the real publisher URL before extraction.
-- Resolution results are cached to reduce duplicate Google requests.
-- Extraction responses include `requested_url`, `resolved_url`, and `google_resolve`.
+Lightweight article extraction service with a hardened Google News resolver.
 
-Extraction cascade:
-1. Google News URL resolution when needed
-2. HTTP + Trafilatura
-3. JSON-LD / DOM fallbacks
-4. Optional browser rendering when `render=true`
+## Google News resolver
 
-Start:
-`uvicorn app:app --host 0.0.0.0 --port $PORT`
+The resolver no longer depends on `googlenewsdecoder==0.1.7`. It uses the current
+Google News `data-n-a-id` / `data-n-a-sg` / `data-n-a-ts` flow with bounded
+retries, persistent HTTP/2 connection reuse, browser-like headers, rate control,
+positive/negative caching, validation, a circuit breaker, and a conservative
+legacy embedded-URL fallback.
+
+Endpoints:
+- `POST /extract` — extract one article.
+- `POST /resolve-google` — resolve one Google News URL.
+- `POST /resolve-google/batch` — resolve multiple URLs with bounded concurrency.
+- `GET /health` — service health.
+
+The resolver never returns a Google URL as a successful publisher URL. If
+resolution fails, the response clearly reports the reason so a caller can choose
+a different extraction path.
