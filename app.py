@@ -18,7 +18,7 @@ from pydantic import BaseModel, HttpUrl
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
     description="Non-AI source article + site-structure extraction service for NEWS BYTE.",
-    version="1.9.0",
+    version="1.12.1",
 )
 
 # NEWS BYTE is a personal extension. CORS is open so the extension can call
@@ -1067,6 +1067,8 @@ async def health():
     return {
         "ok": True,
         "service": "news-byte-source-extractor",
+        "version": "1.12.1",
+        "status": "ok",
         "ai": False,
         "google_resolver": "rpc+independent-chromium",
     }

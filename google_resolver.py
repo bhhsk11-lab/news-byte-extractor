@@ -803,8 +803,10 @@ class GoogleNewsResolver:
         except Exception as exc:
             return ResolveResult(url, "failed", str(exc)[:240])
 
+    CHROMIUM_RESOLVE_TIMEOUT_SECONDS = 20.0
+
     async def _browser_resolve(self, url: str) -> ResolveResult:
-        """Resolve with the server's installed Chromium, without an artificial timeout."""
+        """Resolve with the server's installed Chromium, with a 20-second Chromium-only budget."""
         context = await self._get_browser()
         async with self._browser_page_sem:
             page = await context.new_page()
@@ -831,6 +833,9 @@ class GoogleNewsResolver:
 
             page.on("response", on_response)
             try:
+                # Chromium gets the only explicit resolver timeout: 20 seconds.
+                # Playwright's per-navigation timeout remains disabled so we control
+                # the budget here and can also inspect redirects/DOM continuously.
                 page.set_default_navigation_timeout(0)
                 page.set_default_timeout(0)
 
@@ -841,7 +846,20 @@ class GoogleNewsResolver:
                     page.goto(url, wait_until="commit", timeout=0)
                 )
 
+                # Chromium is allowed to follow redirects and render client-side
+                # navigation freely, but the entire Chromium resolver gets a 20-second
+                # budget so one Google URL cannot occupy a server worker forever.
+                settled_since = None
+                POST_NAV_STABILIZE_SECONDS = 20.0
+                chromium_deadline = time.monotonic() + self.CHROMIUM_RESOLVE_TIMEOUT_SECONDS
+
                 while True:
+                    if time.monotonic() >= chromium_deadline:
+                        return ResolveResult(
+                            url,
+                            "browser-timeout",
+                            "chromium-resolve-timeout-20s",
+                        )
                     current = page.url or url
                     remember(current, "page.url")
 
@@ -860,6 +878,8 @@ class GoogleNewsResolver:
                             return ResolveResult(best, "browser")
 
                     if navigation and navigation.done():
+                        if settled_since is None:
+                            settled_since = time.monotonic()
                         try:
                             await navigation
                         except Exception as exc:
@@ -867,10 +887,17 @@ class GoogleNewsResolver:
                                 best = max(candidates, key=self._article_like_score)
                                 return ResolveResult(best, "browser")
                             return ResolveResult(url, "browser-failed", f"{type(exc).__name__}: {exc}"[:240])
-                        # Navigation completed without a publisher candidate.
-                        # Keep polling because Google may perform a later client-side
-                        # redirect/navigation. There is intentionally no poll-count
-                        # or wall-clock cutoff here.
+
+                        # Chromium has finished its navigation. Continue watching
+                        # for client-side redirects, but don't let a page that has
+                        # clearly settled with no publisher URL hang the entire
+                        # FastAPI worker indefinitely.
+                        if time.monotonic() - settled_since >= POST_NAV_STABILIZE_SECONDS:
+                            return ResolveResult(
+                                url,
+                                "browser-failed",
+                                "chromium-navigation-complete-no-publisher",
+                            )
 
                     await asyncio.sleep(BROWSER_POLL_MS / 1000.0)
             except asyncio.CancelledError:
