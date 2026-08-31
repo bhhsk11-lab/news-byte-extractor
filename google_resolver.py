@@ -1,5 +1,12 @@
 """Resilient Google News URL resolver.
 
+v1.7.1 change: added in-flight request coalescing to resolve() — the same
+Google News article ID was observed being resolved multiple times
+concurrently (this server + auth-bypass-scraper as fallback, and
+overlapping feed-poll requests hitting this server alone). Concurrent
+callers for the same URL now share one in-flight resolution instead of each
+triggering their own redundant RPC/browser attempt.
+
 Google News RSS links are not normal HTTP redirects. Current links are resolved
 by reading data-n-a-id/data-n-a-sg/data-n-a-ts from the Google article page and
 calling Google's DotsSplashUi/batchexecute RPC.  This module keeps that logic
@@ -87,6 +94,15 @@ class GoogleNewsResolver:
         self._browser_context = None
         self._browser_lock = asyncio.Lock()
         self._browser_page_sem = asyncio.Semaphore(2)
+        # In-flight coalescing (see auth-bypass-scraper's google_resolver.py
+        # for the full rationale): the production logs show the same Google
+        # News article ID being requested repeatedly in close succession —
+        # both from this server and from auth-bypass-scraper independently,
+        # and from overlapping feed-poll requests hitting this server alone.
+        # Without this, N concurrent callers for the same URL each pay the
+        # full RPC+browser resolution cost; with it, only the first pays it
+        # and the rest await that one in-flight result.
+        self._inflight: dict[str, asyncio.Future] = {}
 
     async def client(self) -> httpx.AsyncClient:
         if self._client and not self._client.is_closed:
@@ -468,6 +484,26 @@ class GoogleNewsResolver:
         if cached and cached.method not in {"failed", "browser-failed"}:
             return cached
 
+        existing = self._inflight.get(url)
+        if existing is not None:
+            return await existing
+
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future = loop.create_future()
+        self._inflight[url] = future
+        try:
+            result = await self._resolve_uncached(url)
+            if not future.done():
+                future.set_result(result)
+            return result
+        except Exception as exc:
+            if not future.done():
+                future.set_exception(exc)
+            raise
+        finally:
+            self._inflight.pop(url, None)
+
+    async def _resolve_uncached(self, url: str) -> ResolveResult:
         article_id = self.article_id(url)
         if not article_id:
             return ResolveResult(url, "invalid-google-url", "missing-article-id")
