@@ -32,13 +32,23 @@ assert urls == [PUB], urls
 bad='[[["Fbv4je","[\\"garturlres\\",\\"https://www.w3.org/XML/1998/namespace\\",null]",null,"generic"]]]'
 assert r._urls_from_rpc(bad) == []
 
-assert REQUEST_TIMEOUT is None
-assert BROWSER_NAV_TIMEOUT_MS == 0
-assert BROWSER_POLLS == 0
+assert REQUEST_TIMEOUT == 5.0
+assert BROWSER_NAV_TIMEOUT_MS == 6000
+assert BROWSER_POLLS == 18
 
 async def main():
     result=await r.resolve('https://example.com/article')
     assert result.url == 'https://example.com/article' and result.method == 'passthrough'
+
+    # Deadline must produce a graceful result rather than raising/cancelling.
+    async def slow(_url):
+        await asyncio.sleep(0.05)
+        raise RuntimeError('simulated-google-stall')
+    r._resolve_http = slow
+    r._browser_resolve = lambda _url: asyncio.sleep(0.05, result=type('R', (), {'url': URL, 'method':'browser-timeout', 'error':'simulated'})())
+    timed = await r._resolve_uncached(URL)
+    assert timed.method in ('failed', 'timeout')
+    assert timed.url == URL
     await r.close()
 
 asyncio.run(main())

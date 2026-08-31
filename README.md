@@ -34,6 +34,17 @@ a different extraction path.
 The resolver treats the Google News `batchexecute`/`garturlres` response as authoritative. Browser HTML is only a fallback. External XML namespaces (including `https://www.w3.org/XML/1998/namespace`), Google infrastructure, tracking hosts, and asset URLs are explicitly rejected so they can never become a publisher URL.
 
 
-## Google News resolver 1.9.0
+## Google News resolver 1.9.1
 
-The Google News resolver uses the page-provided signed article token (`data-p` / `data-n-a-*`) and the `Fbv4je` `garturlreq` decoder. It parses `garturlres` specifically and fails closed on unrelated Google/XML/schema/asset URLs. Browser-TLS requests use `curl-cffi` Chrome/Safari impersonation when available. Resolver/network operations intentionally do not set an application-level timeout; the caller/platform remains responsible for its own request lifetime.
+The Google News resolver uses the page-provided signed article token (`data-p` / `data-n-a-*`) and the `Fbv4je` `garturlreq` decoder. It parses `garturlres` specifically and fails closed on unrelated Google/XML/schema/asset URLs. Browser-TLS requests use `curl-cffi` Chrome/Safari impersonation when available. Resolver/network operations use short per-leg timeouts and a 12-second overall resolver deadline. A Google stall is converted into a normal `timeout`/`failed` result instead of hanging until the hosting platform emits `AbortError` at ~30 seconds. This lets the briefing pipeline continue with other stories.
+
+
+## Failure behavior
+
+A Google News item is never allowed to hold `/extract` indefinitely. The resolver order is:
+1. signed `data-n-a-*` parameter fetch;
+2. `Fbv4je` / `garturlreq` RPC;
+3. strict Chromium redirect/metadata fallback;
+4. graceful `timeout`/`failed` result.
+
+A graceful resolver failure is returned as a normal API response, so the caller can skip that one story and continue the briefing rather than losing the whole briefing.

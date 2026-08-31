@@ -585,7 +585,7 @@ async def fetch_rendered(url: str):
             viewport={"width": 1440, "height": 1800},
         )
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=7000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=6500)
             await page.wait_for_timeout(500)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.70)")
             await page.wait_for_timeout(300)
@@ -609,8 +609,8 @@ async def extract_one(url: str, render: bool, max_chars: int):
     # Google interstitial to plain HTTP clients, so resolve them first.
     resolved_url, resolve_method, resolve_error = await resolve_google_news_url(url)
     url = resolved_url
-    if resolve_method == "failed":
-        errors.append("google-resolve:" + (resolve_error or "failed"))
+    if resolve_method in ("failed", "timeout"):
+        errors.append("google-resolve:" + (resolve_error or resolve_method or "failed"))
     elif resolve_method and resolve_method not in ("cache", "passthrough"):
         errors.append("google-resolve:" + resolve_method)
         # If this was a Google News link and we still only have the raw

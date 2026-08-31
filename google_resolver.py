@@ -43,15 +43,16 @@ BATCH_ENDPOINT = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
 # unless the RPC path really fails.
 PAGE_CONCURRENCY = 3
 BATCH_CONCURRENCY = 1
-REQUEST_TIMEOUT = None  # intentionally unlimited; no resolver abort timeout
-MAX_RETRIES = 5
+REQUEST_TIMEOUT = 5.0  # keep each network leg below the platform request budget
+MAX_RETRIES = 1
 CACHE_TTL = 6 * 60 * 60
 NEGATIVE_TTL = 12
 CACHE_MAX = 2000
 RPC_MIN_INTERVAL = 0.75
-BROWSER_NAV_TIMEOUT_MS = 0  # 0 = unlimited in Playwright
-BROWSER_POLL_MS = 500
-BROWSER_POLLS = 0  # 0 = poll until navigation resolves or the caller closes it
+RESOLVE_DEADLINE = 12.0
+BROWSER_NAV_TIMEOUT_MS = 6000
+BROWSER_POLL_MS = 300
+BROWSER_POLLS = 18
 
 _BROWSER_HEADERS = {
     "User-Agent": (
@@ -119,6 +120,7 @@ class GoogleNewsResolver:
             url,
             impersonate=impersonate,
             allow_redirects=True,
+            timeout=5,
             headers=GoogleNewsResolver._curl_headers(),
         )
 
@@ -130,6 +132,7 @@ class GoogleNewsResolver:
             url,
             impersonate=impersonate,
             allow_redirects=True,
+            timeout=5,
             headers=_RPC_HEADERS,
             data=body,
         )
@@ -578,7 +581,7 @@ class GoogleNewsResolver:
 
         Prefer curl-cffi browser TLS impersonation because Google can treat a
         plain httpx TLS fingerprint differently from a real browser.  Chrome is
-        tried first and Safari second.  No request timeout is supplied.
+        tried first and Safari second.  A short per-leg timeout is used so one Google stall cannot kill the briefing.
         """
         targets = (
             f"https://news.google.com/rss/articles/{article_id}",
@@ -617,7 +620,7 @@ class GoogleNewsResolver:
                             delay = 1.0 + attempt * 1.5 + random.random()
                             await asyncio.sleep(delay)
 
-        # httpx fallback, also with an unlimited timeout.
+        # httpx fallback with the same bounded timeout.
         client = await self.client()
         async with self._page_sem:
             for target in targets:
@@ -721,11 +724,11 @@ class GoogleNewsResolver:
         async with self._browser_page_sem:
             page = await context.new_page()
             try:
-                page.set_default_navigation_timeout(0)
-                page.set_default_timeout(0)
-                await page.goto(url, wait_until="domcontentloaded", timeout=0)
+                page.set_default_navigation_timeout(BROWSER_NAV_TIMEOUT_MS)
+                page.set_default_timeout(BROWSER_NAV_TIMEOUT_MS)
+                await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_NAV_TIMEOUT_MS)
 
-                while True:
+                for _ in range(BROWSER_POLLS):
                     current = page.url
                     if current != url and self._valid_destination(current):
                         return ResolveResult(current, "browser")
@@ -740,6 +743,7 @@ class GoogleNewsResolver:
                             return ResolveResult(best, "browser")
 
                     await asyncio.sleep(BROWSER_POLL_MS / 1000.0)
+                return ResolveResult(url, "browser-timeout", "browser-resolution-deadline")
             except Exception as exc:
                 return ResolveResult(url, "browser-failed", f"{type(exc).__name__}: {exc}"[:240])
             finally:
@@ -797,9 +801,21 @@ class GoogleNewsResolver:
             self._inflight.pop(url, None)
 
     async def _resolve_uncached(self, url: str) -> ResolveResult:
-        # IMPORTANT: the authoritative path is the garturl RPC. Browser is a
-        # fallback only. This prevents Google page assets/namespaces from being
-        # mistaken for publisher URLs.
+        # Keep the whole resolver below the hosting platform's request budget.
+        # A resolver timeout is a normal, recoverable result — never an abort.
+        try:
+            return await asyncio.wait_for(self._resolve_staged(url), timeout=RESOLVE_DEADLINE)
+        except asyncio.TimeoutError:
+            result = ResolveResult(url, "timeout", "google-resolver-deadline")
+            self._cache_put(url, result, ttl=NEGATIVE_TTL)
+            return result
+        except Exception as exc:
+            result = ResolveResult(url, "failed", f"resolver-error:{type(exc).__name__}")
+            self._cache_put(url, result, ttl=NEGATIVE_TTL)
+            return result
+
+    async def _resolve_staged(self, url: str) -> ResolveResult:
+        # Authoritative RPC first; browser is independent fallback.
         http_result = await self._resolve_http(url)
         if (
             http_result.method not in ("failed", "invalid-google-url")
@@ -813,9 +829,7 @@ class GoogleNewsResolver:
             self._cache_put(url, browser_result)
             return browser_result
 
-        detail = "; ".join(
-            x for x in [http_result.error, browser_result.error] if x
-        )
+        detail = "; ".join(x for x in [http_result.error, browser_result.error] if x)
         result = ResolveResult(url, "failed", detail[:300] or "google-url-unresolved")
         self._cache_put(url, result, ttl=NEGATIVE_TTL)
         return result
