@@ -19,3 +19,11 @@ Endpoints:
 The resolver never returns a Google URL as a successful publisher URL. If
 resolution fails, the response clearly reports the reason so a caller can choose
 a different extraction path.
+
+## v1.6.0 reliability changes
+- Per-URL Google News resolution deadline (no global circuit breaker).
+- Short upstream HTTP/RPC timeouts and bounded retrying.
+- Negative cache is brief and does not poison unrelated Google News URLs.
+- `/extract` has a hard 24-second server deadline to stay below typical 30-second clients.
+- Publisher HTTP extraction gets its own bounded timeout.
+- Optional rendered fallback is bounded to 7 seconds with shorter waits.

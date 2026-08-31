@@ -29,15 +29,18 @@ BATCH_ENDPOINT = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
 
 # Keep the concurrency deliberately small. Google can return 429 from the RPC
 # even when every individual request works in isolation.
-PAGE_CONCURRENCY = 2
+PAGE_CONCURRENCY = 3
 BATCH_CONCURRENCY = 1
-REQUEST_TIMEOUT = httpx.Timeout(12.0, connect=6.0, read=10.0, write=10.0, pool=5.0)
-MAX_RETRIES = 2
+# Keep each upstream operation short enough that /extract still has time for
+# the publisher request. The browser/client has a ~30s deadline, so Google
+# resolution must never consume that whole budget.
+RESOLVE_DEADLINE = 8.5
+REQUEST_TIMEOUT = httpx.Timeout(5.5, connect=3.5, read=4.5, write=4.5, pool=3.0)
+MAX_RETRIES = 1
 CACHE_TTL = 6 * 60 * 60
 CACHE_MAX = 2000
-NEGATIVE_TTL = 45
-CIRCUIT_OPEN_SECONDS = 20
-RPC_MIN_INTERVAL = 0.65
+NEGATIVE_TTL = 8
+RPC_MIN_INTERVAL = 0.45
 
 _BROWSER_HEADERS = {
     "User-Agent": (
@@ -79,8 +82,6 @@ class GoogleNewsResolver:
         self._rpc_sem = asyncio.Semaphore(BATCH_CONCURRENCY)
         self._client: httpx.AsyncClient | None = None
         self._client_lock = asyncio.Lock()
-        self._failure_count = 0
-        self._circuit_until = 0.0
         self._last_rpc_at = 0.0
 
     async def client(self) -> httpx.AsyncClient:
@@ -331,14 +332,12 @@ class GoogleNewsResolver:
                         headers=_RPC_HEADERS,
                     )
                     if response.status_code == 429:
-                        self._failure_count += 1
                         raise RuntimeError("google-rpc-429")
                     if response.status_code >= 500:
                         raise RuntimeError(f"google-rpc-http-{response.status_code}")
                     response.raise_for_status()
                     urls = self._urls_from_rpc(response.text)
                     if urls:
-                        self._failure_count = 0
                         return urls
                     raise RuntimeError("google-rpc-empty")
                 except Exception:
@@ -354,35 +353,39 @@ class GoogleNewsResolver:
         cached = self._cache_get(url)
         if cached:
             return cached
-        if time.monotonic() < self._circuit_until:
-            return ResolveResult(url, "circuit-open", "google-circuit-open")
 
         article_id = self.article_id(url)
         if not article_id:
             return ResolveResult(url, "invalid-google-url", "missing-article-id")
 
         try:
-            params = await self._fetch_params(article_id)
-            if params.get("legacy_url") and self._valid_destination(params["legacy_url"]):
-                result = ResolveResult(params["legacy_url"], "legacy-embedded")
-                self._cache_put(url, result)
-                return result
-
-            decoded = await self._rpc_decode([params])
-            for candidate in decoded:
-                if self._valid_destination(candidate):
-                    result = ResolveResult(candidate, "batchexecute")
+            # Per-URL deadline: a slow Google request must not poison or block
+            # unrelated feed items. There is intentionally no global circuit
+            # breaker: one burst of failures must not make every other article
+            # return `circuit-open`.
+            async with asyncio.timeout(RESOLVE_DEADLINE):
+                params = await self._fetch_params(article_id)
+                if params.get("legacy_url") and self._valid_destination(params["legacy_url"]):
+                    result = ResolveResult(params["legacy_url"], "legacy-embedded")
                     self._cache_put(url, result)
                     return result
-            raise RuntimeError("google-rpc-no-publisher-url")
+
+                decoded = await self._rpc_decode([params])
+                for candidate in decoded:
+                    if self._valid_destination(candidate):
+                        result = ResolveResult(candidate, "batchexecute")
+                        self._cache_put(url, result)
+                        return result
+                raise RuntimeError("google-rpc-no-publisher-url")
+        except TimeoutError:
+            error = "google-resolve-timeout"
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            self._failure_count += 1
-            if self._failure_count >= 4:
-                self._circuit_until = time.monotonic() + CIRCUIT_OPEN_SECONDS
-                self._failure_count = 0
-            result = ResolveResult(url, "failed", str(exc)[:160])
-            self._cache_put(url, result, NEGATIVE_TTL)
-            return result
+            error = str(exc)[:160] or type(exc).__name__
+        result = ResolveResult(url, "failed", error)
+        self._cache_put(url, result, NEGATIVE_TTL)
+        return result
 
     async def resolve_many(self, urls: list[str]) -> list[ResolveResult]:
         """Resolve many URLs with bounded concurrency and exact URL association.

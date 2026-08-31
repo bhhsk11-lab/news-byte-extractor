@@ -18,7 +18,7 @@ from pydantic import BaseModel, HttpUrl
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
     description="Non-AI source article + site-structure extraction service for NEWS BYTE.",
-    version="1.5.0",
+    version="1.6.0",
 )
 
 # NEWS BYTE is a personal extension. CORS is open so the extension can call
@@ -38,6 +38,7 @@ USER_AGENT = (
 )
 
 MAX_DOWNLOAD_BYTES = 8_000_000
+EXTRACT_DEADLINE = 24.0
 MIN_GOOD_WORDS = 120
 MIN_GOOD_SCORE = 0.30
 
@@ -536,7 +537,7 @@ async def fetch_html(url: str):
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    timeout = httpx.Timeout(20.0, connect=10.0)
+    timeout = httpx.Timeout(10.0, connect=4.0, read=8.0, write=8.0, pool=3.0)
 
     async with httpx.AsyncClient(
         headers=headers,
@@ -584,10 +585,10 @@ async def fetch_rendered(url: str):
             viewport={"width": 1440, "height": 1800},
         )
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(1500)
+            await page.goto(url, wait_until="domcontentloaded", timeout=7000)
+            await page.wait_for_timeout(500)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.70)")
-            await page.wait_for_timeout(900)
+            await page.wait_for_timeout(300)
             return await page.content(), page.url
         finally:
             await browser.close()
@@ -1091,11 +1092,33 @@ async def resolve_google_batch_endpoint(request: dict):
 
 @app.post("/extract")
 async def extract_endpoint(request: ExtractRequest):
-    return await extract_one(
-        str(request.url),
-        request.render,
-        min(max(request.max_chars, 1000), 100000),
-    )
+    # Keep the complete request below the extension's ~30s client deadline.
+    # The resolver and publisher fetches have their own smaller deadlines, so
+    # one slow upstream cannot consume the entire request budget.
+    try:
+        return await asyncio.wait_for(
+            extract_one(
+                str(request.url),
+                request.render,
+                min(max(request.max_chars, 1000), 100000),
+            ),
+            timeout=EXTRACT_DEADLINE,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "ok": False,
+            "url": str(request.url),
+            "requested_url": str(request.url),
+            "resolved_url": str(request.url),
+            "google_resolve": "timeout",
+            "google_resolve_error": "extract-deadline-exceeded",
+            "title": "", "author": "", "published": "", "image": "",
+            "description": "", "text": "", "paragraphs": [],
+            "word_count": 0, "extraction_score": 0,
+            "method": "request-timeout",
+            "errors": ["extract:timeout"],
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
 
 
 if __name__ == "__main__":
