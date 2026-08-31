@@ -18,7 +18,7 @@ from pydantic import BaseModel, HttpUrl
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
     description="Non-AI source article + site-structure extraction service for NEWS BYTE.",
-    version="1.7.1",
+    version="1.9.0",
 )
 
 # NEWS BYTE is a personal extension. CORS is open so the extension can call

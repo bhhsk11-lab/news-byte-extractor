@@ -27,3 +27,13 @@ a different extraction path.
 - `/extract` has a hard 24-second server deadline to stay below typical 30-second clients.
 - Publisher HTTP extraction gets its own bounded timeout.
 - Optional rendered fallback is bounded to 7 seconds with shorter waits.
+
+
+## Google News resolver v1.8.0
+
+The resolver treats the Google News `batchexecute`/`garturlres` response as authoritative. Browser HTML is only a fallback. External XML namespaces (including `https://www.w3.org/XML/1998/namespace`), Google infrastructure, tracking hosts, and asset URLs are explicitly rejected so they can never become a publisher URL.
+
+
+## Google News resolver 1.9.0
+
+The Google News resolver uses the page-provided signed article token (`data-p` / `data-n-a-*`) and the `Fbv4je` `garturlreq` decoder. It parses `garturlres` specifically and fails closed on unrelated Google/XML/schema/asset URLs. Browser-TLS requests use `curl-cffi` Chrome/Safari impersonation when available. Resolver/network operations intentionally do not set an application-level timeout; the caller/platform remains responsible for its own request lifetime.
