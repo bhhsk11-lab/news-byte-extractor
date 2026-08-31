@@ -38,7 +38,7 @@ USER_AGENT = (
 )
 
 MAX_DOWNLOAD_BYTES = 8_000_000
-EXTRACT_DEADLINE = 24.0
+EXTRACT_DEADLINE = 0  # retained for compatibility; /extract does not abort the request
 MIN_GOOD_WORDS = 120
 MIN_GOOD_SCORE = 0.30
 
@@ -1050,7 +1050,7 @@ async def proxy_image(url: str):
 async def root():
     return {
         "service": "NEWS BYTE Source Extractor",
-        "version": "1.4.0",
+        "version": "1.7.0",
         "ai": False,
         "usage": {
             "extract": "POST /extract with {url, render, max_chars} — single article, flat text.",
@@ -1067,7 +1067,7 @@ async def health():
         "ok": True,
         "service": "news-byte-source-extractor",
         "ai": False,
-        "google_resolver": "hardened",
+        "google_resolver": "rpc+independent-chromium",
     }
 
 
@@ -1092,33 +1092,14 @@ async def resolve_google_batch_endpoint(request: dict):
 
 @app.post("/extract")
 async def extract_endpoint(request: ExtractRequest):
-    # Keep the complete request below the extension's ~30s client deadline.
-    # The resolver and publisher fetches have their own smaller deadlines, so
-    # one slow upstream cannot consume the entire request budget.
-    try:
-        return await asyncio.wait_for(
-            extract_one(
-                str(request.url),
-                request.render,
-                min(max(request.max_chars, 1000), 100000),
-            ),
-            timeout=EXTRACT_DEADLINE,
-        )
-    except asyncio.TimeoutError:
-        return {
-            "ok": False,
-            "url": str(request.url),
-            "requested_url": str(request.url),
-            "resolved_url": str(request.url),
-            "google_resolve": "timeout",
-            "google_resolve_error": "extract-deadline-exceeded",
-            "title": "", "author": "", "published": "", "image": "",
-            "description": "", "text": "", "paragraphs": [],
-            "word_count": 0, "extraction_score": 0,
-            "method": "request-timeout",
-            "errors": ["extract:timeout"],
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-        }
+    # No artificial whole-request abort. Google News resolution may need the
+    # independent Chromium resolver, and the caller should receive the real
+    # result rather than a synthetic timeout/empty article.
+    return await extract_one(
+        str(request.url),
+        request.render,
+        min(max(request.max_chars, 1000), 100000),
+    )
 
 
 if __name__ == "__main__":

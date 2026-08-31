@@ -17,7 +17,7 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urljoin
 
 import httpx
 from bs4 import BeautifulSoup
@@ -34,8 +34,8 @@ BATCH_CONCURRENCY = 1
 # Keep each upstream operation short enough that /extract still has time for
 # the publisher request. The browser/client has a ~30s deadline, so Google
 # resolution must never consume that whole budget.
-RESOLVE_DEADLINE = 8.5
-REQUEST_TIMEOUT = httpx.Timeout(5.5, connect=3.5, read=4.5, write=4.5, pool=3.0)
+RESOLVE_DEADLINE = 0  # no artificial resolver abort; browser navigation uses event-based waits
+REQUEST_TIMEOUT = httpx.Timeout(8.0, connect=5.0, read=7.0, write=7.0, pool=5.0)
 MAX_RETRIES = 1
 CACHE_TTL = 6 * 60 * 60
 CACHE_MAX = 2000
@@ -83,6 +83,10 @@ class GoogleNewsResolver:
         self._client: httpx.AsyncClient | None = None
         self._client_lock = asyncio.Lock()
         self._last_rpc_at = 0.0
+        self._browser = None
+        self._browser_context = None
+        self._browser_lock = asyncio.Lock()
+        self._browser_page_sem = asyncio.Semaphore(2)
 
     async def client(self) -> httpx.AsyncClient:
         if self._client and not self._client.is_closed:
@@ -99,8 +103,118 @@ class GoogleNewsResolver:
         return self._client
 
     async def close(self) -> None:
+        if self._browser_context is not None:
+            try:
+                await self._browser_context.close()
+            except Exception:
+                pass
+            self._browser_context = None
+        if self._browser is not None:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+
+    async def _get_browser(self):
+        """Independent Chromium used ONLY for Google News URL resolution."""
+        if self._browser_context is not None:
+            return self._browser_context
+        async with self._browser_lock:
+            if self._browser_context is not None:
+                return self._browser_context
+            try:
+                from playwright.async_api import async_playwright
+            except ImportError as exc:
+                raise RuntimeError("playwright-not-installed") from exc
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            self._browser_context = await self._browser.new_context(
+                user_agent=_BROWSER_HEADERS["User-Agent"],
+                viewport={"width": 1365, "height": 900},
+                locale="en-US",
+                timezone_id="America/New_York",
+                ignore_https_errors=False,
+            )
+            await self._browser_context.set_extra_http_headers({
+                "Accept-Language": "en-US,en;q=0.9",
+            })
+            return self._browser_context
+
+    @staticmethod
+    def _browser_candidates(html: str, current_url: str) -> list[str]:
+        """Find real publisher URLs exposed by the rendered Google page."""
+        found = []
+        soup = BeautifulSoup(html or "", "lxml")
+        selectors = [
+            ("link", {"rel": "canonical"}, "href"),
+            ("meta", {"property": "og:url"}, "content"),
+            ("meta", {"name": "twitter:url"}, "content"),
+        ]
+        for tag_name, attrs, field in selectors:
+            for tag in soup.find_all(tag_name, attrs=attrs):
+                value = tag.get(field)
+                if value and GoogleNewsResolver._valid_destination(value):
+                    found.append(unquote(value))
+
+        # Google article pages may contain the publisher destination in anchors
+        # even when navigation is held on a Google interstitial. Prefer article-
+        # looking external links and ignore Google infrastructure.
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "").strip()
+            if href.startswith("/"):
+                href = urljoin(current_url, href)
+            if GoogleNewsResolver._valid_destination(href):
+                found.append(unquote(href))
+
+        # Raw HTML fallback for URLs embedded in script state.
+        for m in re.finditer(r"https?://[^\s\"'<>\\]+", html or ""):
+            candidate = unquote(m.group(0)).rstrip(".,)]}")
+            if GoogleNewsResolver._valid_destination(candidate):
+                found.append(candidate)
+        return list(dict.fromkeys(found))
+
+    async def _browser_resolve(self, url: str) -> ResolveResult:
+        """Open the exact Google News URL in an independent Chromium context.
+
+        No fixed navigation timeout is used. We wait on browser events and inspect
+        the actual destination/canonical URL. If Google keeps an interstitial, the
+        rendered DOM is searched for the external publisher URL.
+        """
+        context = await self._get_browser()
+        async with self._browser_page_sem:
+            page = await context.new_page()
+            try:
+                page.set_default_navigation_timeout(0)
+                page.set_default_timeout(0)
+                await page.goto(url, wait_until="domcontentloaded", timeout=0)
+                # Give Google client-side navigation a chance to complete, but do
+                # not impose a wall-clock abort. Event-based checks stop as soon
+                # as a publisher URL is observed.
+                for _ in range(40):
+                    current = page.url
+                    if self._valid_destination(current):
+                        return ResolveResult(current, "browser")
+                    html = await page.content()
+                    candidates = self._browser_candidates(html, current)
+                    if candidates:
+                        # Prefer the canonical/meta destination over arbitrary
+                        # Google-page links; candidates are already filtered.
+                        return ResolveResult(candidates[0], "browser")
+                    await asyncio.sleep(0.25)
+                return ResolveResult(url, "browser-failed", "publisher-url-not-observed")
+            finally:
+                await page.close()
 
     @staticmethod
     def is_google_url(url: str) -> bool:
@@ -351,41 +465,42 @@ class GoogleNewsResolver:
         if not self.is_google_url(url):
             return ResolveResult(url, "passthrough")
         cached = self._cache_get(url)
-        if cached:
+        if cached and cached.method not in {"failed", "browser-failed"}:
             return cached
 
         article_id = self.article_id(url)
         if not article_id:
             return ResolveResult(url, "invalid-google-url", "missing-article-id")
 
+        # Phase 1: lightweight HTTP/RPC decoder.
         try:
-            # Per-URL deadline: a slow Google request must not poison or block
-            # unrelated feed items. There is intentionally no global circuit
-            # breaker: one burst of failures must not make every other article
-            # return `circuit-open`.
-            async with asyncio.timeout(RESOLVE_DEADLINE):
-                params = await self._fetch_params(article_id)
-                if params.get("legacy_url") and self._valid_destination(params["legacy_url"]):
-                    result = ResolveResult(params["legacy_url"], "legacy-embedded")
+            params = await self._fetch_params(article_id)
+            if params.get("legacy_url") and self._valid_destination(params["legacy_url"]):
+                result = ResolveResult(params["legacy_url"], "legacy-embedded")
+                self._cache_put(url, result)
+                return result
+            decoded = await self._rpc_decode([params])
+            for candidate in decoded:
+                if self._valid_destination(candidate):
+                    result = ResolveResult(candidate, "batchexecute")
                     self._cache_put(url, result)
                     return result
-
-                decoded = await self._rpc_decode([params])
-                for candidate in decoded:
-                    if self._valid_destination(candidate):
-                        result = ResolveResult(candidate, "batchexecute")
-                        self._cache_put(url, result)
-                        return result
-                raise RuntimeError("google-rpc-no-publisher-url")
-        except TimeoutError:
-            error = "google-resolve-timeout"
-        except asyncio.CancelledError:
-            raise
+            first_error = "google-rpc-no-publisher-url"
         except Exception as exc:
-            error = str(exc)[:160] or type(exc).__name__
-        result = ResolveResult(url, "failed", error)
-        self._cache_put(url, result, NEGATIVE_TTL)
-        return result
+            first_error = str(exc)[:160] or type(exc).__name__
+
+        # Phase 2: ALWAYS use the independent Chromium resolver when the HTTP
+        # decoder did not produce a publisher URL. This is deliberately separate
+        # from the article-fetch/render browser so Google failures cannot poison
+        # publisher extraction state.
+        try:
+            browser_result = await self._browser_resolve(url)
+            if self._valid_destination(browser_result.url):
+                self._cache_put(url, browser_result)
+                return browser_result
+            return ResolveResult(url, "failed", f"{first_error};{browser_result.error or 'browser-failed'}")
+        except Exception as exc:
+            return ResolveResult(url, "failed", f"{first_error};browser:{type(exc).__name__}")
 
     async def resolve_many(self, urls: list[str]) -> list[ResolveResult]:
         """Resolve many URLs with bounded concurrency and exact URL association.
