@@ -469,7 +469,18 @@ def extract_article(html: str, url: str, method: str) -> dict:
     seen = set()
     junk_dropped = 0
 
-    raw_text = data.get("text", "") or text
+    # BUG FIX: this used to re-read `data.get("text", "")` here -- the RAW,
+    # pre-enhancement trafilatura output -- which silently discarded the
+    # JSON-LD articleBody swap (line ~436) and the DOM-selector fallback
+    # (line ~463) whenever trafilatura's own extraction returned ANY non-empty
+    # text (which is most of the time, even when that text is a thin, wrong
+    # teaser). `text` at this point already holds whichever candidate was
+    # actually longest/best; that's what must be paragraph-split, not the
+    # stale raw trafilatura output. Confirmed via a deterministic test with
+    # trafilatura's output mocked short and a DOM article-body present: before
+    # this fix, method correctly reported "+dom" while word_count/text still
+    # only reflected the discarded 6-word trafilatura teaser.
+    raw_text = text
 
     for raw in re.split(r"\n+", raw_text):
         paragraph = clean(raw)
