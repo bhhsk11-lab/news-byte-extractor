@@ -91,7 +91,7 @@ MAX_RETRIES = 1
 CACHE_TTL = 6 * 60 * 60
 NEGATIVE_TTL = 12
 CACHE_MAX = 2000
-RPC_MIN_INTERVAL = 0.75
+RPC_MIN_INTERVAL = 1.5
 # Google News resolution is intentionally not bounded by an application-level
 # wall-clock deadline. The browser is the authoritative last-resort resolver
 # and must be allowed to keep navigating/polling until it obtains a publisher
@@ -99,6 +99,7 @@ RPC_MIN_INTERVAL = 0.75
 RESOLVE_DEADLINE = None
 BROWSER_NAV_TIMEOUT_MS = 0
 BROWSER_POLL_MS = 500
+CHROMIUM_RESOLVE_TIMEOUT_SECONDS = 30.0
 
 _BROWSER_HEADERS = {
     "User-Agent": (
@@ -649,9 +650,12 @@ class GoogleNewsResolver:
         plain httpx TLS fingerprint differently from a real browser.  Chrome is
         tried first and Safari second.  A short per-leg timeout is used so one Google stall cannot kill the briefing.
         """
+        # Current community implementations report fewer 429s when the
+        # /articles endpoint is tried before /rss/articles. Keep RSS as the
+        # fallback because both formats are seen in feeds.
         targets = (
-            f"https://news.google.com/rss/articles/{article_id}",
             f"https://news.google.com/articles/{article_id}",
+            f"https://news.google.com/rss/articles/{article_id}",
         )
         last = "params-unavailable"
 
@@ -803,13 +807,29 @@ class GoogleNewsResolver:
         except Exception as exc:
             return ResolveResult(url, "failed", str(exc)[:240])
 
-    CHROMIUM_RESOLVE_TIMEOUT_SECONDS = 20.0
+    CHROMIUM_RESOLVE_TIMEOUT_SECONDS = 30.0
 
     async def _browser_resolve(self, url: str) -> ResolveResult:
-        """Resolve with the server's installed Chromium, with a 20-second Chromium-only budget."""
+        """Resolve with the server's installed Chromium, with a 30-second Chromium-only budget."""
         context = await self._get_browser()
         async with self._browser_page_sem:
             page = await context.new_page()
+            # Google redirect resolution needs HTML/JS, but not images, fonts,
+            # media, or stylesheets. Blocking those reduces latency and load
+            # without interfering with the navigation/JS that performs the
+            # redirect.
+            async def _route(route):
+                try:
+                    if route.request.resource_type in {"image", "font", "media", "stylesheet"}:
+                        await route.abort()
+                    else:
+                        await route.continue_()
+                except Exception:
+                    try:
+                        await route.continue_()
+                    except Exception:
+                        pass
+            await page.route("**/*", _route)
             candidates: list[str] = []
             navigation = None
 
@@ -847,18 +867,18 @@ class GoogleNewsResolver:
                 )
 
                 # Chromium is allowed to follow redirects and render client-side
-                # navigation freely, but the entire Chromium resolver gets a 20-second
+                # navigation freely, but the entire Chromium resolver gets a 30-second
                 # budget so one Google URL cannot occupy a server worker forever.
                 settled_since = None
                 POST_NAV_STABILIZE_SECONDS = 20.0
-                chromium_deadline = time.monotonic() + self.CHROMIUM_RESOLVE_TIMEOUT_SECONDS
+                chromium_deadline = time.monotonic() + CHROMIUM_RESOLVE_TIMEOUT_SECONDS
 
                 while True:
                     if time.monotonic() >= chromium_deadline:
                         return ResolveResult(
                             url,
                             "browser-timeout",
-                            "chromium-resolve-timeout-20s",
+                            "chromium-resolve-timeout-30s",
                         )
                     current = page.url or url
                     remember(current, "page.url")

@@ -18,7 +18,7 @@ from pydantic import BaseModel, HttpUrl
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
     description="Non-AI source article + site-structure extraction service for NEWS BYTE.",
-    version="1.12.1",
+    version="1.12.3",
 )
 
 # NEWS BYTE is a personal extension. CORS is open so the extension can call
@@ -41,6 +41,12 @@ MAX_DOWNLOAD_BYTES = 8_000_000
 EXTRACT_DEADLINE = 0  # retained for compatibility; /extract does not abort the request
 MIN_GOOD_WORDS = 120
 MIN_GOOD_SCORE = 0.30
+
+# Strict extraction serialization: only ONE /extract job may execute at a time.
+# A request keeps the lock for its complete Google-resolution + article-extraction
+# pipeline. The next request starts only after the previous response is ready.
+# This prevents concurrent Chromium/RPC/extraction load from piling up.
+EXTRACT_SERIAL_LOCK = asyncio.Lock()
 
 # Google News RSS article links are encoded Google redirect URLs, not publisher
 # article URLs. Keep a small in-process cache to avoid resolving the same link
@@ -1095,14 +1101,17 @@ async def resolve_google_batch_endpoint(request: dict):
 
 @app.post("/extract")
 async def extract_endpoint(request: ExtractRequest):
-    # No artificial whole-request abort. Google News resolution may need the
-    # independent Chromium resolver, and the caller should receive the real
-    # result rather than a synthetic timeout/empty article.
-    return await extract_one(
-        str(request.url),
-        request.render,
-        min(max(request.max_chars, 1000), 100000),
-    )
+    # Strictly serialize the COMPLETE extraction pipeline. Request N+1 does
+    # not start until request N has finished resolving/extracting and its
+    # response object has been produced.
+    async with EXTRACT_SERIAL_LOCK:
+        result = await extract_one(
+            str(request.url),
+            request.render,
+            min(max(request.max_chars, 1000), 100000),
+        )
+        result["server_queue_mode"] = "serial-1"
+        return result
 
 
 if __name__ == "__main__":
