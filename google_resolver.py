@@ -167,38 +167,48 @@ class GoogleNewsResolver:
             })
             return self._browser_context
 
-    @staticmethod
-    def _browser_candidates(html: str, current_url: str) -> list[str]:
-        """Find real publisher URLs exposed by the rendered Google page."""
-        found = []
+    @classmethod
+    def _browser_candidates(cls, html: str, current_url: str) -> list[str]:
+        """Find likely publisher article URLs, never Google infrastructure/assets."""
+        scored: dict[str, int] = {}
         soup = BeautifulSoup(html or "", "lxml")
-        selectors = [
-            ("link", {"rel": "canonical"}, "href"),
-            ("meta", {"property": "og:url"}, "content"),
-            ("meta", {"name": "twitter:url"}, "content"),
-        ]
-        for tag_name, attrs, field in selectors:
+
+        def add(value: str | None, score: int):
+            if not value:
+                return
+            value = unquote(str(value)).strip()
+            if value.startswith("//"):
+                value = "https:" + value
+            absolute = urljoin(current_url, value)
+            if not cls._valid_destination(absolute):
+                return
+            p = urlparse(absolute)
+            path = p.path.lower()
+            bonus = 0
+            if len(path.strip("/")) > 12:
+                bonus += 8
+            if any(x in path for x in ("/article", "/news/", "/story/", "/stories/", "/world/", "/business/", "/technology/")):
+                bonus += 15
+            # Prefer publisher-like URLs over generic homepages.
+            if path in ("", "/"):
+                bonus -= 30
+            scored[absolute.split("#", 1)[0]] = max(scored.get(absolute.split("#", 1)[0], -999), score + bonus)
+
+        for tag_name, attrs, field, score in (
+            ("link", {"rel": "canonical"}, "href", 100),
+            ("meta", {"property": "og:url"}, "content", 95),
+            ("meta", {"name": "twitter:url"}, "content", 90),
+        ):
             for tag in soup.find_all(tag_name, attrs=attrs):
-                value = tag.get(field)
-                if value and GoogleNewsResolver._valid_destination(value):
-                    found.append(unquote(value))
+                add(tag.get(field), score)
 
-        # Google article pages may contain the publisher destination in anchors
-        # even when navigation is held on a Google interstitial. Prefer article-
-        # looking external links and ignore Google infrastructure.
         for a in soup.find_all("a", href=True):
-            href = a.get("href", "").strip()
-            if href.startswith("/"):
-                href = urljoin(current_url, href)
-            if GoogleNewsResolver._valid_destination(href):
-                found.append(unquote(href))
+            add(a.get("href"), 55)
 
-        # Raw HTML fallback for URLs embedded in script state.
         for m in re.finditer(r"https?://[^\s\"'<>\\]+", html or ""):
-            candidate = unquote(m.group(0)).rstrip(".,)]}")
-            if GoogleNewsResolver._valid_destination(candidate):
-                found.append(candidate)
-        return list(dict.fromkeys(found))
+            add(m.group(0).rstrip(".,)]}"), 45)
+
+        return [u for u, _ in sorted(scored.items(), key=lambda kv: kv[1], reverse=True)]
 
     async def _browser_resolve(self, url: str) -> ResolveResult:
         """Open the exact Google News URL in an independent Chromium context.
@@ -213,11 +223,11 @@ class GoogleNewsResolver:
             try:
                 page.set_default_navigation_timeout(0)
                 page.set_default_timeout(0)
-                await page.goto(url, wait_until="domcontentloaded", timeout=0)
+                await page.goto(url, wait_until="domcontentloaded", timeout=6000)
                 # Give Google client-side navigation a chance to complete, but do
                 # not impose a wall-clock abort. Event-based checks stop as soon
                 # as a publisher URL is observed.
-                for _ in range(40):
+                for _ in range(20):
                     current = page.url
                     if self._valid_destination(current):
                         return ResolveResult(current, "browser")
@@ -254,7 +264,18 @@ class GoogleNewsResolver:
             return None
 
     @staticmethod
-    def _valid_destination(value: str | None) -> bool:
+    @staticmethod
+    def _host_is_google_infra(host: str) -> bool:
+        h = (host or "").lower().rstrip(".")
+        return (
+            h == "google.com" or h.endswith(".google.com")
+            or h == "gstatic.com" or h.endswith(".gstatic.com")
+            or h == "googleusercontent.com" or h.endswith(".googleusercontent.com")
+            or h == "googleapis.com" or h.endswith(".googleapis.com")
+        )
+
+    @classmethod
+    def _valid_destination(cls, value: str | None) -> bool:
         if not value:
             return False
         try:
@@ -262,7 +283,17 @@ class GoogleNewsResolver:
             host = (p.hostname or "").lower()
             if p.scheme not in ("http", "https") or not host:
                 return False
-            if host == GOOGLE_HOST or host.endswith(".google.com"):
+            if cls._host_is_google_infra(host):
+                return False
+            if any(x in host for x in (
+                "doubleclick.net", "googlesyndication.com", "google-analytics.com",
+                "googletagmanager.com", "googleadservices.com",
+            )):
+                return False
+            path = (p.path or "").lower()
+            # A Google redirect page can expose scripts/images/fonts as external
+            # URLs. Those are not article destinations.
+            if re.search(r"\.(?:js|css|mjs|woff2?|ttf|otf|png|jpe?g|gif|webp|svg|ico|mp4|webm)(?:$|\?)", path):
                 return False
             return True
         except Exception:

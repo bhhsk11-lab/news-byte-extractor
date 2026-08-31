@@ -685,8 +685,12 @@ async def extract_one(url: str, render: bool, max_chars: int):
         except Exception as exc:
             errors.append("render:" + type(exc).__name__)
 
-    if last_result and last_result.get("image"):
-        last_result["ok"] = False
+    # Preserve any non-trivial extraction even when it misses the strict
+    # quality threshold. Returning the text is much safer than converting a
+    # real short article into an EMPTY/0-word result. The extension can decide
+    # whether to use it for a briefing.
+    if last_result and len((last_result.get("text") or "").split()) >= 25:
+        last_result["ok"] = True
         last_result["method"] = last_result.get("method", "failed") + "+low-quality"
         last_result["errors"] = errors
         last_result["text"] = last_result.get("text", "")[:max_chars]

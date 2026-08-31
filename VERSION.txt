@@ -1,0 +1,2 @@
+1.7.2
+Reliability fixes: reject gstatic/google infrastructure as publisher URLs; bounded Google browser fallback; preserve useful short extraction instead of EMPTY.
