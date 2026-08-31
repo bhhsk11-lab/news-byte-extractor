@@ -19,7 +19,6 @@ import asyncio
 import base64
 import json
 import logging
-import os
 import random
 import re
 import time
@@ -39,48 +38,6 @@ logger = logging.getLogger("google_resolver")
 
 GOOGLE_HOST = "news.google.com"
 BATCH_ENDPOINT = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
-
-# ── Anti-block layer ────────────────────────────────────────────────────
-# Every network call in this module previously went out raw from wherever
-# this service is deployed. Multiple independent implementations of this
-# same Google News RPC technique (Python, Node.js, Elixir ports) explicitly
-# document that Google can rate-limit or block the request regardless of
-# headers/TLS fingerprint -- no client-side header trick fixes an IP-level
-# block. Route through the SAME residential proxy already used by the
-# sibling auth-bypass-scraper service (same env var name, so existing
-# credentials work here unchanged) as the primary anti-block measure, with
-# ScraperAPI's residential pool as a final fallback specifically for the
-# article-page fetch (the step that was observed failing).
-# FlareSolverr is intentionally NOT used here: it solves Cloudflare's JS
-# challenge specifically, and news.google.com is not behind Cloudflare, so
-# it would add complexity without addressing the actual failure mode.
-PROXY_URL = os.getenv("PROXY_URL") or None
-SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY") or None
-SCRAPERAPI_COUNTRY = os.getenv("SCRAPERAPI_COUNTRY") or None
-
-
-def _proxies() -> dict[str, str] | None:
-    if PROXY_URL:
-        return {"http": PROXY_URL, "https": PROXY_URL}
-    return None
-
-
-def _playwright_proxy() -> dict[str, str] | None:
-    """Playwright wants a structured {server, username, password} dict, not
-    the http://user:pass@host:port string form used by requests/httpx."""
-    if not PROXY_URL:
-        return None
-    try:
-        p = urlparse(PROXY_URL)
-        server = f"{p.scheme}://{p.hostname}:{p.port}" if p.port else f"{p.scheme}://{p.hostname}"
-        proxy: dict[str, str] = {"server": server}
-        if p.username:
-            proxy["username"] = unquote(p.username)
-        if p.password:
-            proxy["password"] = unquote(p.password)
-        return proxy
-    except Exception:
-        return None
 
 # Keep Google requests bounded. Do not create a browser page per feed item
 # unless the RPC path really fails.
@@ -165,7 +122,6 @@ class GoogleNewsResolver:
             allow_redirects=True,
             timeout=5,
             headers=GoogleNewsResolver._curl_headers(),
-            proxies=_proxies(),
         )
 
     @staticmethod
@@ -179,23 +135,6 @@ class GoogleNewsResolver:
             timeout=5,
             headers=_RPC_HEADERS,
             data=body,
-            proxies=_proxies(),
-        )
-
-    @staticmethod
-    def _scraperapi_get_sync(url: str):
-        """Final-resort fetch of the Google article page via ScraperAPI's
-        residential pool. Only used when both curl_cffi (proxied) and the
-        proxied httpx client have already failed."""
-        if not SCRAPERAPI_KEY:
-            raise RuntimeError("scraperapi-not-configured")
-        if curl_requests is None:
-            raise RuntimeError("curl-cffi-not-installed")
-        params = {"api_key": SCRAPERAPI_KEY, "url": url}
-        if SCRAPERAPI_COUNTRY:
-            params["country_code"] = SCRAPERAPI_COUNTRY
-        return curl_requests.get(
-            "https://api.scraperapi.com", params=params, timeout=25,
         )
 
     async def client(self) -> httpx.AsyncClient:
@@ -209,7 +148,6 @@ class GoogleNewsResolver:
                     max_redirects=6,
                     timeout=REQUEST_TIMEOUT,
                     http2=True,
-                    proxy=PROXY_URL,  # httpx>=0.26 uses a single proxy=, not proxies={}
                 )
         return self._client
 
@@ -250,7 +188,6 @@ class GoogleNewsResolver:
             self._playwright = await async_playwright().start()
             self._browser = await self._playwright.chromium.launch(
                 headless=True,
-                proxy=_playwright_proxy(),
                 args=[
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
@@ -707,30 +644,6 @@ class GoogleNewsResolver:
                         last = f"params-{type(exc).__name__}"
                     if attempt < MAX_RETRIES:
                         await asyncio.sleep(1.0 + attempt * 1.5 + random.random())
-
-        # Final resort: ScraperAPI's residential pool. Only reached when both
-        # the proxied curl_cffi attempts and the proxied httpx attempts above
-        # have already failed for every target URL.
-        if SCRAPERAPI_KEY:
-            for target in targets:
-                try:
-                    response = await asyncio.to_thread(self._scraperapi_get_sync, target)
-                    status = int(response.status_code)
-                    if status == 200:
-                        text = response.text or ""
-                        params = self._extract_params(text, article_id)
-                        if params:
-                            params["fetch_method"] = "scraperapi"
-                            return params
-                        legacy = self._legacy_extract(text)
-                        if legacy:
-                            return {"legacy_url": legacy, "fetch_method": "scraperapi"}
-                        last = "signature-not-found-scraperapi"
-                    else:
-                        last = f"scraperapi-http-{status}"
-                except Exception as exc:
-                    last = f"scraperapi-{type(exc).__name__}"
-
         raise RuntimeError(last)
 
     async def _rpc_decode(self, params: dict[str, str]) -> str:
