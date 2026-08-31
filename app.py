@@ -18,7 +18,7 @@ from pydantic import BaseModel, HttpUrl
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
     description="Non-AI source article + site-structure extraction service for NEWS BYTE.",
-    version="1.9.0",
+    version="1.11.0",
 )
 
 # NEWS BYTE is a personal extension. CORS is open so the extension can call
@@ -649,6 +649,7 @@ async def extract_one(url: str, render: bool, max_chars: int):
                 "word_count": 0,
                 "extraction_score": 0,
                 "method": "google-resolve-failed",
+                "fallback_required": True,
                 "errors": errors,
                 "fetched_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -666,6 +667,7 @@ async def extract_one(url: str, render: bool, max_chars: int):
         result["resolved_url"] = final_url
         result["google_resolve"] = resolve_method
         result["google_resolve_error"] = resolve_error
+        result["fallback_required"] = False
         last_result = result
 
         if (
@@ -690,6 +692,7 @@ async def extract_one(url: str, render: bool, max_chars: int):
             )
 
             if result["ok"]:
+                result["fallback_required"] = False
                 result["text"] = result["text"][:max_chars]
                 return result
 
@@ -704,6 +707,7 @@ async def extract_one(url: str, render: bool, max_chars: int):
         last_result["ok"] = True
         last_result["method"] = last_result.get("method", "failed") + "+low-quality"
         last_result["errors"] = errors
+        last_result["fallback_required"] = True
         last_result["text"] = last_result.get("text", "")[:max_chars]
         return last_result
 
@@ -724,6 +728,7 @@ async def extract_one(url: str, render: bool, max_chars: int):
         "word_count": 0,
         "extraction_score": 0,
         "method": "failed",
+        "fallback_required": bool(google_resolver.is_google_url(requested_url) or url != requested_url),
         "errors": errors,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1065,7 +1070,7 @@ async def proxy_image(url: str):
 async def root():
     return {
         "service": "NEWS BYTE Source Extractor",
-        "version": "1.7.0",
+        "version": "1.10.0",
         "ai": False,
         "usage": {
             "extract": "POST /extract with {url, render, max_chars} — single article, flat text.",
@@ -1081,6 +1086,7 @@ async def health():
     return {
         "ok": True,
         "service": "news-byte-source-extractor",
+        "version": "1.11.0",
         "ai": False,
         "google_resolver": "rpc+independent-chromium",
     }

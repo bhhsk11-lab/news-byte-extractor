@@ -1,50 +1,69 @@
-# NEWS BYTE Source Extractor
+# NEWS BYTE Source Extractor v1.11.0
 
-Lightweight article extraction service with a hardened Google News resolver.
+Non-AI article extraction service with a dedicated Google News publisher URL resolver.
 
 ## Google News resolver
 
-The resolver no longer depends on `googlenewsdecoder==0.1.7`. It uses the current
-Google News `data-n-a-id` / `data-n-a-sg` / `data-n-a-ts` flow with bounded
-retries, persistent HTTP/2 connection reuse, browser-like headers, rate control,
-positive/negative caching, validation, a circuit breaker, and a conservative
-legacy embedded-URL fallback.
+For `news.google.com/rss/articles/...`, the server starts two independent resolution paths concurrently:
 
-Endpoints:
-- `POST /extract` — extract one article.
+1. Google signed `Fbv4je` / `garturlreq` HTTP/RPC decoding.
+2. Dedicated Playwright Chromium.
+
+### Chromium is unlimited
+
+The Chromium resolver has **no application-level wall-clock deadline**, no polling-count limit, and no Playwright navigation timeout. It uses `timeout=0` and continues until:
+
+- Chromium naturally reaches a validated publisher URL; or
+- Chromium reports a real browser/navigation/runtime error; or
+- the caller/process explicitly cancels the operation.
+
+There is no `asyncio.wait_for()` / `asyncio.timeout()` around Google resolution.
+
+The HTTP/RPC path still has finite per-network-leg timeouts so a dead HTTP connection cannot prevent the independent Chromium resolver from running. Both paths start together; the first validated publisher URL wins.
+
+## Extraction fallback contract
+
+When the Google URL resolves successfully, `/extract` uses the **publisher URL** for normal extraction.
+
+If publisher extraction is empty or fails, the response preserves:
+
+```json
+"resolved_url": "https://publisher.example/news/story"
+```
+
+and sets:
+
+```json
+"fallback_required": true
+```
+
+The extension should then send **`resolved_url`** to the auth-bypass scraper. It should not send the original Google News URL in this case.
+
+If Google resolution itself fails, `resolved_url` remains the original Google URL and `fallback_required` is true; this is the only case where the original Google URL is the last-resort fallback.
+
+## Strict URL validation
+
+The resolver rejects Google infrastructure, W3/XML namespaces, schema URLs, tracking/asset URLs, and other non-article destinations. Browser HTML is only used for high-confidence canonical/OG/JSON-LD/article-anchor candidates.
+
+## Endpoints
+
+- `POST /extract` — Google resolve + article extraction.
 - `POST /resolve-google` — resolve one Google News URL.
-- `POST /resolve-google/batch` — resolve multiple URLs with bounded concurrency.
-- `GET /health` — service health.
+- `POST /resolve-google/batch` — resolve up to 50 Google News URLs.
+- `GET /health` — health/version information.
 
-The resolver never returns a Google URL as a successful publisher URL. If
-resolution fails, the response clearly reports the reason so a caller can choose
-a different extraction path.
+## Self-test
 
-## v1.6.0 reliability changes
-- Per-URL Google News resolution deadline (no global circuit breaker).
-- Short upstream HTTP/RPC timeouts and bounded retrying.
-- Negative cache is brief and does not poison unrelated Google News URLs.
-- `/extract` has a hard 24-second server deadline to stay below typical 30-second clients.
-- Publisher HTTP extraction gets its own bounded timeout.
-- Optional rendered fallback is bounded to 7 seconds with shorter waits.
+`test_google_resolver.py` verifies:
 
+- Google News URL recognition.
+- Signed parameter extraction.
+- `garturlres` parsing.
+- Strict publisher URL validation.
+- W3/XML/schema rejection.
+- Concurrent HTTP/Chromium resolution.
+- Chromium navigation timeout is `0`.
+- No resolver wall-clock deadline.
+- No Chromium polling-count deadline.
 
-## Google News resolver v1.8.0
-
-The resolver treats the Google News `batchexecute`/`garturlres` response as authoritative. Browser HTML is only a fallback. External XML namespaces (including `https://www.w3.org/XML/1998/namespace`), Google infrastructure, tracking hosts, and asset URLs are explicitly rejected so they can never become a publisher URL.
-
-
-## Google News resolver 1.9.1
-
-The Google News resolver uses the page-provided signed article token (`data-p` / `data-n-a-*`) and the `Fbv4je` `garturlreq` decoder. It parses `garturlres` specifically and fails closed on unrelated Google/XML/schema/asset URLs. Browser-TLS requests use `curl-cffi` Chrome/Safari impersonation when available. Resolver/network operations use short per-leg timeouts and a 12-second overall resolver deadline. A Google stall is converted into a normal `timeout`/`failed` result instead of hanging until the hosting platform emits `AbortError` at ~30 seconds. This lets the briefing pipeline continue with other stories.
-
-
-## Failure behavior
-
-A Google News item is never allowed to hold `/extract` indefinitely. The resolver order is:
-1. signed `data-n-a-*` parameter fetch;
-2. `Fbv4je` / `garturlreq` RPC;
-3. strict Chromium redirect/metadata fallback;
-4. graceful `timeout`/`failed` result.
-
-A graceful resolver failure is returned as a normal API response, so the caller can skip that one story and continue the briefing rather than losing the whole briefing.
+`live_chromium_test.py` performs a real Chromium-only test and prints the final publisher URL. Run it inside the Docker image because the Dockerfile installs Playwright Chromium.
