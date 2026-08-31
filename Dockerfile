@@ -9,7 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py .
+COPY app.py google_resolver.py .
+RUN python -m py_compile app.py google_resolver.py
 RUN useradd --create-home --uid 1000 user && chown -R user:user /app
 USER user
 EXPOSE 10000
