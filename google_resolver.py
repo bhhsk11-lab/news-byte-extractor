@@ -86,19 +86,17 @@ def _playwright_proxy() -> dict[str, str] | None:
 # unless the RPC path really fails.
 PAGE_CONCURRENCY = 3
 BATCH_CONCURRENCY = 1
-REQUEST_TIMEOUT = 4.0  # keep each network leg below the platform request budget
-MAX_RETRIES = 0
+REQUEST_TIMEOUT = 5.0  # keep each network leg below the platform request budget
+MAX_RETRIES = 1
 CACHE_TTL = 6 * 60 * 60
-# Negative results are deliberately short-lived: Google can fail transiently
-# (429/network/edge variation), so do not pin an article as unresolved.
-NEGATIVE_TTL = 5
+NEGATIVE_TTL = 12
 CACHE_MAX = 2000
 RPC_MIN_INTERVAL = 0.75
-# Google News resolution intentionally has NO application-level deadline.
-# Chromium is allowed to keep resolving until it naturally reaches a publisher
-# URL or the browser reports a real navigation failure. Do not wrap the
-# resolver in asyncio.wait_for()/asyncio.timeout().
-RESOLVE_DEADLINE = 0
+# Google News resolution is intentionally not bounded by an application-level
+# wall-clock deadline. The browser is the authoritative last-resort resolver
+# and must be allowed to keep navigating/polling until it obtains a publisher
+# URL or the browser itself reports a genuine failure.
+RESOLVE_DEADLINE = None
 BROWSER_NAV_TIMEOUT_MS = 0
 BROWSER_POLL_MS = 500
 
@@ -168,7 +166,7 @@ class GoogleNewsResolver:
             url,
             impersonate=impersonate,
             allow_redirects=True,
-            timeout=None,
+            timeout=5,
             headers=GoogleNewsResolver._curl_headers(),
             proxies=_proxies(),
         )
@@ -181,7 +179,7 @@ class GoogleNewsResolver:
             url,
             impersonate=impersonate,
             allow_redirects=True,
-            timeout=None,
+            timeout=5,
             headers=_RPC_HEADERS,
             data=body,
             proxies=_proxies(),
@@ -806,52 +804,86 @@ class GoogleNewsResolver:
             return ResolveResult(url, "failed", str(exc)[:240])
 
     async def _browser_resolve(self, url: str) -> ResolveResult:
-        """Dedicated Chromium resolver with no artificial time limit.
-
-        The browser is a resolver, not an article extractor. It is allowed to
-        remain on the Google page as long as necessary. We only finish when a
-        validated publisher URL is observed or Chromium itself raises a real
-        navigation/runtime error. There is deliberately no wait_for(),
-        navigation timeout, polling-count limit, or fixed wall-clock deadline.
-        """
+        """Resolve with the server's installed Chromium, without an artificial timeout."""
         context = await self._get_browser()
         async with self._browser_page_sem:
             page = await context.new_page()
+            candidates: list[str] = []
+            navigation = None
+
+            def remember(value: str | None, source: str = "") -> None:
+                if not value:
+                    return
+                value = unquote(str(value)).strip()
+                if value.startswith("//"):
+                    value = "https:" + value
+                absolute = urljoin(page.url or url, value).split("#", 1)[0]
+                if self._valid_destination(absolute) and absolute not in candidates:
+                    candidates.append(absolute)
+                    logger.info("Google Chromium candidate (%s): %s", source, absolute)
+
+            def on_response(response) -> None:
+                try:
+                    if getattr(response.request, "resource_type", "") == "document":
+                        remember(response.url, "document-response")
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
             try:
                 page.set_default_navigation_timeout(0)
                 page.set_default_timeout(0)
 
-                # Do not impose a timeout on Google navigation. If Google takes
-                # a long time to redirect, Chromium is allowed to keep waiting.
-                await page.goto(url, wait_until="domcontentloaded", timeout=0)
+                # Do not wait for DOMContentLoaded before inspecting the browser.
+                # Google can navigate/redirect while the original navigation task
+                # is still pending.
+                navigation = asyncio.create_task(
+                    page.goto(url, wait_until="commit", timeout=0)
+                )
 
-                last_url = ""
                 while True:
                     current = page.url or url
-                    if current != last_url:
-                        logger.info("Google Chromium URL url=%s current=%s", url, current)
-                        last_url = current
+                    remember(current, "page.url")
 
-                    if current != url and self._valid_destination(current):
-                        return ResolveResult(current, "browser")
+                    try:
+                        html = await page.content()
+                        for candidate in self._browser_candidates(html, current):
+                            remember(candidate, "dom")
+                    except Exception:
+                        pass
 
-                    html = await page.content()
-                    candidates = self._browser_candidates(html, current)
                     if candidates:
-                        for candidate in candidates:
-                            if self._article_like_score(candidate) >= 8:
-                                return ResolveResult(candidate, "browser")
+                        best = max(candidates, key=self._article_like_score)
+                        if self._article_like_score(best) >= 8:
+                            if navigation and not navigation.done():
+                                navigation.cancel()
+                            return ResolveResult(best, "browser")
 
-                    # Wait forever in small cooperative intervals. The interval
-                    # is not a timeout; it simply prevents a busy loop while the
-                    # page's JavaScript/network activity continues.
+                    if navigation and navigation.done():
+                        try:
+                            await navigation
+                        except Exception as exc:
+                            if candidates:
+                                best = max(candidates, key=self._article_like_score)
+                                return ResolveResult(best, "browser")
+                            return ResolveResult(url, "browser-failed", f"{type(exc).__name__}: {exc}"[:240])
+                        # Navigation completed without a publisher candidate.
+                        # Keep polling because Google may perform a later client-side
+                        # redirect/navigation. There is intentionally no poll-count
+                        # or wall-clock cutoff here.
+
                     await asyncio.sleep(BROWSER_POLL_MS / 1000.0)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("Google Chromium resolver failed url=%s error=%s", url, exc)
-                return ResolveResult(url, "browser-failed", f"{type(exc).__name__}: {exc}"[:500])
+                return ResolveResult(url, "browser-failed", f"{type(exc).__name__}: {exc}"[:240])
             finally:
+                if navigation is not None and not navigation.done():
+                    navigation.cancel()
+                    try:
+                        await navigation
+                    except BaseException:
+                        pass
                 try:
                     await page.close()
                 except Exception:
@@ -906,56 +938,33 @@ class GoogleNewsResolver:
             self._inflight.pop(url, None)
 
     async def _resolve_uncached(self, url: str) -> ResolveResult:
-        """Run independent Google resolvers with no artificial resolver deadline."""
+        # No application-level timeout surrounds staged Google resolution.
         try:
             return await self._resolve_staged(url)
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
-            logger.warning("Google resolver error url=%s error=%s", url, exc)
-            result = ResolveResult(url, "failed", f"resolver-error:{type(exc).__name__}")
+            result = ResolveResult(url, "failed", f"resolver-error:{type(exc).__name__}:{exc}"[:300])
             self._cache_put(url, result, ttl=NEGATIVE_TTL)
             return result
 
     async def _resolve_staged(self, url: str) -> ResolveResult:
-        """Run HTTP/RPC and Chromium independently.
+        # Authoritative RPC first; browser is independent fallback.
+        http_result = await self._resolve_http(url)
+        if (
+            http_result.method not in ("failed", "invalid-google-url")
+            and self._valid_destination(http_result.url)
+        ):
+            self._cache_put(url, http_result)
+            return http_result
 
-        There is no wall-clock deadline here. A resolver task is allowed to
-        continue until it produces a validated publisher URL or reports a real
-        failure. As soon as one path succeeds, the other path is cancelled.
-        """
-        http_task = asyncio.create_task(self._resolve_http(url))
-        browser_task = asyncio.create_task(self._browser_resolve(url))
-        tasks = {http_task, browser_task}
-        results: list[ResolveResult] = []
-        try:
-            while tasks:
-                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    try:
-                        result = await task
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        result = ResolveResult(url, "failed", f"{type(exc).__name__}:{exc}")
-                    results.append(result)
-                    if self._valid_destination(result.url) and (
-                        result.method == "batchexecute"
-                        or result.method.startswith("browser")
-                        or result.method == "legacy-embedded"
-                    ):
-                        self._cache_put(url, result)
-                        return result
+        browser_result = await self._browser_resolve(url)
+        if self._valid_destination(browser_result.url) and browser_result.method.startswith("browser"):
+            self._cache_put(url, browser_result)
+            return browser_result
 
-            detail = "; ".join(f"{r.method}:{r.error}" for r in results if r.error)
-            result = ResolveResult(url, "failed", detail[:500] or "google-url-unresolved")
-            self._cache_put(url, result, ttl=NEGATIVE_TTL)
-            return result
-        finally:
-            for task in (http_task, browser_task):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(http_task, browser_task, return_exceptions=True)
+        detail = "; ".join(x for x in [http_result.error, browser_result.error] if x)
+        result = ResolveResult(url, "failed", detail[:300] or "google-url-unresolved")
+        self._cache_put(url, result, ttl=NEGATIVE_TTL)
+        return result
 
     async def resolve_many(self, urls: list[str]) -> list[ResolveResult]:
         sem = asyncio.Semaphore(PAGE_CONCURRENCY)

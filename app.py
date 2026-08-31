@@ -18,7 +18,7 @@ from pydantic import BaseModel, HttpUrl
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
     description="Non-AI source article + site-structure extraction service for NEWS BYTE.",
-    version="1.11.0",
+    version="1.9.0",
 )
 
 # NEWS BYTE is a personal extension. CORS is open so the extension can call
@@ -616,43 +616,26 @@ async def extract_one(url: str, render: bool, max_chars: int):
     requested_url = url
     last_result = None
 
-    # Google News RSS gives encoded /rss/articles/ URLs. They usually return a
-    # Google interstitial to plain HTTP clients, so resolve them first.
+    # Google News RSS URLs are encoded redirects, never article extraction targets.
+    # A raw Google URL is allowed to proceed only inside the resolver. If the
+    # resolver cannot produce a real publisher URL, return failure with
+    # resolved_url=null so the extension cannot forward the Google URL to its
+    # secondary/auth-bypass scraper.
     resolved_url, resolve_method, resolve_error = await resolve_google_news_url(url)
     url = resolved_url
-    if resolve_method in ("failed", "timeout"):
+    if google_resolver.is_google_url(url):
         errors.append("google-resolve:" + (resolve_error or resolve_method or "failed"))
-    elif resolve_method and resolve_method not in ("cache", "passthrough"):
+        return {
+            "ok": False, "url": requested_url, "requested_url": requested_url,
+            "resolved_url": None, "google_resolve": resolve_method or "failed",
+            "google_resolve_error": resolve_error, "fallback_required": False,
+            "title": "", "author": "", "published": "", "image": "",
+            "description": "", "text": "", "paragraphs": [], "word_count": 0,
+            "extraction_score": 0, "method": "google-resolve-failed",
+            "errors": errors, "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+    if resolve_method and resolve_method not in ("cache", "passthrough"):
         errors.append("google-resolve:" + resolve_method)
-        # If this was a Google News link and we still only have the raw
-        # news.google.com redirect (not a publisher URL), fetch_html() below
-        # is guaranteed to fail on it too (Google serves an interstitial to
-        # plain HTTP clients) — that's the http:HTTPStatusError that always
-        # rides along with google-resolve:decoder-failed in the logs. Don't
-        # spend another ~10-20s httpx timeout finding that out; fail fast so
-        # the extension can fail over to the second extractor sooner.
-        if google_resolver.is_google_url(url):
-            return {
-                "ok": False,
-                "url": requested_url,
-                "requested_url": requested_url,
-                "resolved_url": url,
-                "google_resolve": resolve_method,
-                "google_resolve_error": resolve_error,
-                "title": "",
-                "author": "",
-                "published": "",
-                "image": "",
-                "description": "",
-                "text": "",
-                "paragraphs": [],
-                "word_count": 0,
-                "extraction_score": 0,
-                "method": "google-resolve-failed",
-                "fallback_required": True,
-                "errors": errors,
-                "fetched_at": datetime.now(timezone.utc).isoformat(),
-            }
 
     # FAST PATH: ordinary HTTP request.
     try:
@@ -692,7 +675,6 @@ async def extract_one(url: str, render: bool, max_chars: int):
             )
 
             if result["ok"]:
-                result["fallback_required"] = False
                 result["text"] = result["text"][:max_chars]
                 return result
 
@@ -707,7 +689,6 @@ async def extract_one(url: str, render: bool, max_chars: int):
         last_result["ok"] = True
         last_result["method"] = last_result.get("method", "failed") + "+low-quality"
         last_result["errors"] = errors
-        last_result["fallback_required"] = True
         last_result["text"] = last_result.get("text", "")[:max_chars]
         return last_result
 
@@ -715,9 +696,10 @@ async def extract_one(url: str, render: bool, max_chars: int):
         "ok": False,
         "url": requested_url,
         "requested_url": requested_url,
-        "resolved_url": url,
+        "resolved_url": url if not google_resolver.is_google_url(url) else None,
         "google_resolve": resolve_method,
         "google_resolve_error": resolve_error,
+        "fallback_required": bool(google_resolver.is_google_url(requested_url) and not google_resolver.is_google_url(url)),
         "title": "",
         "author": "",
         "published": "",
@@ -728,7 +710,6 @@ async def extract_one(url: str, render: bool, max_chars: int):
         "word_count": 0,
         "extraction_score": 0,
         "method": "failed",
-        "fallback_required": bool(google_resolver.is_google_url(requested_url) or url != requested_url),
         "errors": errors,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1070,7 +1051,7 @@ async def proxy_image(url: str):
 async def root():
     return {
         "service": "NEWS BYTE Source Extractor",
-        "version": "1.10.0",
+        "version": "1.7.0",
         "ai": False,
         "usage": {
             "extract": "POST /extract with {url, render, max_chars} — single article, flat text.",
@@ -1086,7 +1067,6 @@ async def health():
     return {
         "ok": True,
         "service": "news-byte-source-extractor",
-        "version": "1.11.0",
         "ai": False,
         "google_resolver": "rpc+independent-chromium",
     }
