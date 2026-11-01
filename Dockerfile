@@ -25,7 +25,8 @@ RUN mkdir -p /models \
     && curl -fL --retry 3 -o /models/kokoro.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx \
     && curl -fL --retry 3 -o /models/voices.bin  https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 
-COPY main.py audio_clean.py ./
+   COPY main.py .
+   COPY audio_clean.py ./
 
 # One worker: the models live in memory once. Cloud Run scales by adding instances, not workers.
 CMD exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1
