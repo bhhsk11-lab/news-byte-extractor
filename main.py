@@ -40,7 +40,7 @@ WHISPER_DIR = os.getenv("WHISPER_DIR", "/models/whisper")     # baked into the i
 WHISPER_THREADS = int(os.getenv("WHISPER_THREADS", "2"))      # = number of vCPUs
 WHISPER_BEAM = int(os.getenv("WHISPER_BEAM", "2"))            # 1 = greedy = fastest. 2 = good balance. 3-5 = best, slower
 WHISPER_VAD = os.getenv("WHISPER_VAD", "1") == "1"            # drop silence: fewer "Thank you." hallucinations
-ALLOWED_LANGS = [x.strip() for x in re.split(r"[,;| ]+", os.getenv("ALLOWED_LANGS", "en,hi")) if x.strip()]  # auto-detect picks ONLY from these
+ALLOWED_LANGS = [x.strip() for x in re.split(r"[,;| ]+", os.getenv("ALLOWED_LANGS", "en")) if x.strip()]  # auto-detect picks ONLY from these
 WHISPER_HOTWORDS = " ".join(re.split(r"[,;|]+", os.getenv("WHISPER_HOTWORDS", ""))).strip()  # optional: names / terms you say often, separated by spaces
 DENOISE = os.getenv("DENOISE", "auto").strip().lower()        # auto = clean only when the room is noisy, with a safety re-check | on | off
 SNR_CLEAN_DB = float(os.getenv("SNR_CLEAN_DB", "18"))          # recordings at or above this speech-to-noise ratio are never gated
@@ -91,11 +91,9 @@ def warm_up():
         rng = np.random.default_rng(0)
         probe = (0.05 * rng.standard_normal(16000 * 2)).astype(np.float32)   # not silence, so the encoder really runs
         with _stt_lock:
-            _stt["model"].detect_language(probe)
             list(_stt["model"].transcribe(probe, language="en", beam_size=WHISPER_BEAM, without_timestamps=True)[0])
         ac.clean(probe)                                                       # warms numpy FFT paths too
         _synthesize_blocking("Hello.", EN_FEMALE, 1.0)
-        _synthesize_blocking("नमस्ते।", HI_FEMALE, 1.0)
         log.info("warm-up done")
     except Exception as e:  # never block startup because of the warm-up
         log.warning("warm-up skipped: %s", e)
@@ -191,6 +189,8 @@ def _decode(data: bytes) -> np.ndarray:
 
 def _lang_code(language: str):
     """'en-IN' -> 'en', 'hi-IN' -> 'hi', 'hinglish' -> 'hi', '' / 'auto' / unknown -> None (we detect it ourselves)."""
+    if ALLOWED_LANGS == ["en"]:                         # English-only mode: never detect, never guess
+        return "en"
     code = (language or "").strip().lower().replace("_", "-").split("-")[0]
     if code == "hinglish":
         return "hi"
@@ -503,4 +503,4 @@ async def voices(_: None = Depends(auth)):
 async def health():
     return {"ok": _ready.is_set(), "loading": not _ready.is_set() and not _boot["error"], "error": _boot["error"],
             "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": os.path.basename(WHISPER_DIR.rstrip("/")),
-            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v4", "beam": WHISPER_BEAM, "langs": ALLOWED_LANGS}
+            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v5-en", "beam": WHISPER_BEAM, "langs": ALLOWED_LANGS}

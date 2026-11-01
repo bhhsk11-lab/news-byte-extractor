@@ -12,21 +12,21 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 # ---- speech-to-text model --------------------------------------------------------------
-# small  = good English + usable Hindi, ~1 GB RAM       <- default
-# base   = faster, weaker Hindi, ~0.5 GB RAM
-# medium = much better Hindi, but too slow on 2 vCPU for live talking
-# large-v3-turbo = larger and usually more accurate; slower, needs more --memory (not tested on 2 vCPU)
-ARG WHISPER_MODEL=small
+# ENGLISH ONLY build (the ".en" models are trained for English only).
+# small.en = best accuracy for English at ~1 GB RAM       <- default
+# base.en  = about 2x faster, a little less accurate, ~0.5 GB RAM
+# medium.en = more accurate, but too slow for live talking on 2 vCPU
+ARG WHISPER_MODEL=small.en
 RUN python -c "from faster_whisper import download_model; download_model('${WHISPER_MODEL}', output_dir='/models/whisper')"
 
-# ---- text-to-speech model (Kokoro-82M, English + Hindi) --------------------------------
+# ---- text-to-speech model (Kokoro-82M, only English voices are used) --------------------------------
 # Use the full fp32 file. The int8 file is smaller but returns broken audio (NaN) on ordinary sentences.
 RUN mkdir -p /models \
     && curl -fL --retry 3 -o /models/kokoro.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx \
     && curl -fL --retry 3 -o /models/voices.bin  https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 
-   COPY main.py .
-   COPY audio_clean.py ./
+COPY main.py .
+COPY audio_clean.py .
 
 # One worker: the models live in memory once. Cloud Run scales by adding instances, not workers.
 CMD exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1

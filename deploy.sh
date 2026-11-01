@@ -7,6 +7,8 @@ PROJECT="${1:-$(gcloud config get-value project 2>/dev/null)}"
 REGION="${REGION:-asia-south1}"          # Mumbai: closest to India, and full free tier (Tier 1 pricing)
 SERVICE="${SERVICE:-news-byte-extractor}"
 KEY_FILE=".api_key"
+CPU="${CPU:-2}"                           # use  CPU=4 MEMORY=2Gi ./deploy.sh  for a faster (and dearer) server
+MEMORY="${MEMORY:-2Gi}"
 
 [ -n "$PROJECT" ] || { echo "Pass your project id:  ./deploy.sh my-project-id"; exit 1; }
 
@@ -32,10 +34,10 @@ gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregi
 # --min-instances 0   : scale to zero = nothing billed while you are not talking
 gcloud run deploy "$SERVICE" \
   --project "$PROJECT" --region "$REGION" --source . \
-  --cpu 2 --memory 2Gi --cpu-boost \
+  --cpu "$CPU" --memory "$MEMORY" --cpu-boost \
   --min-instances 0 --max-instances 1 --concurrency 4 \
   --timeout 120 --allow-unauthenticated --labels app=cpu-voice \
-  --update-env-vars "API_KEY=${API_KEY},WHISPER_THREADS=2,KOKORO_THREADS=2,WHISPER_BEAM=2"
+  --update-env-vars "API_KEY=${API_KEY},WHISPER_THREADS=${CPU},KOKORO_THREADS=${CPU},WHISPER_BEAM=2,ALLOWED_LANGS=en"
 
 URL="$(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format 'value(status.url)')"
 cat <<MSG

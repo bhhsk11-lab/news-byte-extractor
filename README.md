@@ -5,8 +5,8 @@ Cloud Run service (2 vCPU / 2 GiB). No GPU. Nothing is billed while you are not 
 
 | Job | Model | Why |
 |---|---|---|
-| Speech → text | **faster-whisper `small`** (int8) | Runs on CPU, handles English and Hindi |
-| Text → speech | **Kokoro-82M** (fp32, ONNX) | Natural voice, English + **Hindi**, runs on CPU |
+| Speech → text | **faster-whisper `small.en`** (int8) | Runs on CPU, English only |
+| Text → speech | **Kokoro-82M** (fp32, ONNX) | Natural English voice, runs on CPU |
 
 The extension already speaks the OpenAI speech API, so **no extension changes are needed**. You only paste a URL and a key.
 
@@ -55,7 +55,7 @@ Extension popup → **Speech engines & images**:
 | Speech input (your microphone) | **API** |
 | Transcription model | anything (for example `whisper-small`). The server ignores it |
 | Speech model | anything. The server ignores it |
-| Language I speak | *Automatic*, *Hindi*, or *Hinglish* |
+| Language I speak | *English* (or Automatic). This build is English only |
 
 Firefox will ask permission to contact the new server: click **Allow**. Then pick a voice: any female name
 (Marin, Coral, Nova ...) gives the female Kokoro voice, any male name (Cedar, Ash ...) gives the male one.
@@ -91,7 +91,7 @@ Change these with `gcloud run services update news-byte-extractor --region asia-
 | Setting | Default | When to change |
 |---|---|---|
 | `WHISPER_BEAM` | `2` | `1` = fastest, `3`-`5` = most accurate, slower |
-| `ALLOWED_LANGS` | `en,hi` | Automatic language detection only chooses from these. Add more with `;` between them (gcloud treats commas specially), e.g. `en;hi;pa` |
+| `ALLOWED_LANGS` | `en` | Automatic language detection only chooses from these. Add more with `;` between them (gcloud treats commas specially), e.g. `en;hi;pa` |
 | `WHISPER_HOTWORDS` | empty | Names / terms you say often, separated by `;`, e.g. `Jaipur;Claude;Kokoro`. Helps Whisper spell them right |
 | `DENOISE` | `auto` | `auto` = clean only noisy recordings and double-check unsure ones, `on` = always try the cleaned version first, `off` = never |
 | `SNR_CLEAN_DB` | `18` | Recordings cleaner than this are never noise-gated |
@@ -104,10 +104,10 @@ Change these with `gcloud run services update news-byte-extractor --region asia-
 | `VOICE_HI_FEMALE` / `VOICE_HI_MALE` | `hf_alpha` / `hm_omega` | `hf_beta` / `hm_psi` |
 | `WHISPER_VAD` | `1` | `0` if it cuts off quiet speech |
 
-Changing the **Whisper model** needs a rebuild: edit `ARG WHISPER_MODEL=small` in the `Dockerfile`, then run `./deploy.sh` again.
-* `base`: faster and lighter, but weaker Hindi.
-* `small`: the default.
-* `medium`: clearly better Hindi, but too slow for live talking on 2 vCPU, and it may not fit in 2 GiB next to the voice model.
+Changing the **Whisper model** needs a rebuild: edit `ARG WHISPER_MODEL=small.en` in the `Dockerfile`, then run `./deploy.sh` again.
+* `base.en`: about twice as fast and lighter, a little less accurate.
+* `small.en`: the default.
+* `medium.en`: more accurate, but too slow for live talking on 2 vCPU, and it may not fit in 2 GiB next to the voice model.
 
 Look at live timings in *Cloud Run → news-byte-extractor → Logs*. Every call logs a line like
 `STT 4.1s audio in 1.9s (x2.2 realtime)`. A figure above 1.0 means faster than real time.
@@ -171,3 +171,12 @@ Meaning: Whisper already copes well with steady noise, the gate never made thing
 * `.api_key` is no longer uploaded with your source when deploying.
 
 **More accuracy, more cost (untested here):** in the `Dockerfile` set `ARG WHISPER_MODEL=large-v3-turbo`. It is a larger model, so expect more memory (raise `--memory`) and slower answers on 2 vCPU. Try it and read the `STT ... (x realtime)` log lines before keeping it.
+
+
+---
+
+## English-only build (v5)
+
+This version only understands English. Hindi and Hinglish speech will come out as wrongly spelled English words.
+To change speed, run `CPU=4 MEMORY=2Gi ./deploy.sh` (4 vCPU, about twice the price per active hour).
+`/health` shows `"build": "voice-v5-en"` when this version is running.
