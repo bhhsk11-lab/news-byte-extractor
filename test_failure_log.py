@@ -1,9 +1,0 @@
-from google_resolver import GoogleNewsResolver
-urls=[
-'https://news.google.com/rss/articles/CBMi4AFBVV95cUxPSUJvZ0paNHZ4MVItSDhIVDUwR1Z5UVpNQ3JSbE5vS2gtclFyaU5HNzMyaFFtaDFsRmRPRmx5dVJlS1pSanVQYjZuTjZhVWE4aFdkWTBfNmJHT3RlY1Uyd2FjQllOTmgyQXBFcy1zMFBpcUszRjB5YlZkTFhkdmZSbjA5OU03SWR6cTZYWHJuZGFGaVVfV3lkWmtjVldnZERyd3VnclhyeHBuaDJWMG9CTGFzTzNTTEhnRFc3Q2wtUUs2dFhadWFLcXp1a29KZzBBLVBUWjZIT1BXNjFsTVRWdA?oc=5',
-'https://news.google.com/rss/articles/CBMiywFBVV95cUxNVVpaVXZWQjdTWjY1WWlnUVNLcl9qNTV6YjRDYWFIdXRMd3ZOMTF0aWd3V3E3V3VUQXBPSXlpVXJORXZUV2hFWmlyNEZRRllWaWdwa2xDLWFIWWNpMjhyMTRwZXV6U3pzNmtubkdsNjB2d19pcGNBd3hfRkFmWVUzc3BtSkRlVDd0NnNKa2RuZUJWcmRjSjlXb2YwOE1EdWNiN09xbFFLNEFqR1ZCV1NjMndnNm1MTnNmdlFLU1ZGcVpuVk1XazcwdndGOA?oc=5']
-r=GoogleNewsResolver()
-assert all(r.is_google_url(u) for u in urls)
-assert not r._valid_destination('https://www.w3.org/XML/1998/namespace')
-print(f'LOG TEST: {len(urls)} representative Google News URLs recognized')
-print('LOG TEST: fake W3/XML publisher rejected')
