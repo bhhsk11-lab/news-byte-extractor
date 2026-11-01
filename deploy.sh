@@ -16,6 +16,12 @@ if [ ! -s "$KEY_FILE" ]; then
 fi
 API_KEY="$(cat "$KEY_FILE")"
 
+# never silently overwrite one of your other services
+if gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
+  echo "A Cloud Run service named '$SERVICE' already exists in $REGION. Deploying will replace its image and settings."
+  read -r -p "Continue? [y/N] " yn; [[ "$yn" =~ ^[Yy]$ ]] || { echo "Cancelled. Use a different name:  SERVICE=my-voice ./deploy.sh"; exit 1; }
+fi
+
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com --project "$PROJECT"
 
 # --cpu/--memory      : the 2 vCPU / 2 GiB you have
@@ -28,7 +34,7 @@ gcloud run deploy "$SERVICE" \
   --cpu 2 --memory 2Gi --cpu-boost \
   --min-instances 0 --max-instances 1 --concurrency 4 \
   --timeout 120 --allow-unauthenticated \
-  --set-env-vars "API_KEY=${API_KEY},WHISPER_THREADS=2,KOKORO_THREADS=2"
+  --update-env-vars "API_KEY=${API_KEY},WHISPER_THREADS=2,KOKORO_THREADS=2"
 
 URL="$(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format 'value(status.url)')"
 cat <<MSG
@@ -38,6 +44,9 @@ Put these in the extension:  Settings > Voice
   Speech-to-text  base URL :  ${URL}/v1
   Text-to-speech  base URL :  ${URL}/v1
   API key (both)           :  ${API_KEY}
+
+If the deploy fails, read the real reason with:
+  gcloud run services logs read ${SERVICE} --region ${REGION} --limit 60
 
 Quick test (wakes the server, takes ~10-20 s the first time):
   curl ${URL}/health

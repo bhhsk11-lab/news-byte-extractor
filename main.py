@@ -83,11 +83,37 @@ def warm_up():
         log.warning("warm-up skipped: %s", e)
 
 
+_ready = threading.Event()
+_boot = {"error": None, "t0": time.time()}
+
+
+def _boot_models():
+    try:
+        load_models()
+        warm_up()
+        _ready.set()
+        log.info("READY after %.1fs", time.time() - _boot["t0"])
+    except Exception as e:
+        _boot["error"] = f"{type(e).__name__}: {e}"
+        log.exception("MODEL LOADING FAILED")
+
+
 @asynccontextmanager
 async def lifespan(app):
-    load_models()          # uvicorn only starts listening after this, so no request ever sees a half-loaded server
-    warm_up()
+    # Start listening at once (Cloud Run's startup check passes), load the models in the background.
+    # Requests that arrive while loading wait up to 90 s; a loading failure is written to the logs and shown on /health.
+    threading.Thread(target=_boot_models, daemon=True).start()
     yield
+
+
+async def _require_ready():
+    if _ready.is_set():
+        return
+    if _boot["error"]:
+        raise HTTPException(500, "Voice models failed to load: " + _boot["error"])
+    await run_in_threadpool(_ready.wait, 90)
+    if not _ready.is_set():
+        raise HTTPException(503, "Voice models are still loading, try again in a few seconds.")
 
 
 app = FastAPI(title="CPU voice server", lifespan=lifespan)
@@ -161,6 +187,7 @@ async def transcriptions(
     response_format: str = Form("json"),
     _: None = Depends(auth),
 ):
+    await _require_ready()
     data = await file.read()
     if not data:
         raise HTTPException(400, "Empty audio file.")
@@ -280,6 +307,7 @@ class SpeechRequest(BaseModel):
 @app.post("/v1/audio/speech")
 @app.post("/audio/speech")
 async def speech(req: SpeechRequest, _: None = Depends(auth)):
+    await _require_ready()
     text = _clean(req.input)[:4000]
     if not text:
         raise HTTPException(400, "Empty input.")
@@ -297,11 +325,13 @@ async def speech(req: SpeechRequest, _: None = Depends(auth)):
 # ------------------------------------------------------------------ misc
 @app.get("/v1/voices")
 async def voices(_: None = Depends(auth)):
+    await _require_ready()
     return {"voices": sorted(_tts["voices"])}
 
 
 @app.get("/")
 @app.get("/health")
 async def health():
-    ready = _stt["model"] is not None and _tts["model"] is not None
-    return {"ok": ready, "stt": os.path.basename(WHISPER_DIR.rstrip("/")), "tts": "kokoro-82m", "auth": bool(API_KEY)}
+    return {"ok": _ready.is_set(), "loading": not _ready.is_set() and not _boot["error"], "error": _boot["error"],
+            "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": os.path.basename(WHISPER_DIR.rstrip("/")),
+            "tts": "kokoro-82m", "auth": bool(API_KEY)}

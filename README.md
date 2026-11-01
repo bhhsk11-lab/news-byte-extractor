@@ -108,6 +108,7 @@ Look at live timings in *Cloud Run → voice-server → Logs*. Every call logs a
 
 | Symptom | Fix |
 |---|---|
+| Deploy fails with "failed to start and listen on PORT" | Read the logs: `gcloud run services logs read voice-server --region asia-south1 --limit 60`. Look for `MODEL LOADING FAILED`. `/health` also shows the error text. |
 | First sentence takes 15 to 30 s | Cold start. Open `/health` first (see the tip above). |
 | `401 Invalid API key` | The key in the extension differs from `.api_key`. |
 | `Container ... exceeded memory limit` in logs | Use Whisper `base`, or raise `--memory 3Gi` (more GiB-seconds used, still inside the free memory allowance if you use about 25 busy hours). |
