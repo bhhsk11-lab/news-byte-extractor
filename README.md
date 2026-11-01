@@ -90,7 +90,15 @@ Change these with `gcloud run services update news-byte-extractor --region asia-
 
 | Setting | Default | When to change |
 |---|---|---|
-| `WHISPER_BEAM` | `1` | `2` or `3` = slightly more accurate, slower |
+| `WHISPER_BEAM` | `2` | `1` = fastest, `3`-`5` = most accurate, slower |
+| `ALLOWED_LANGS` | `en,hi` | Automatic language detection only chooses from these. Add more with `;` between them (gcloud treats commas specially), e.g. `en;hi;pa` |
+| `WHISPER_HOTWORDS` | empty | Names / terms you say often, separated by `;`, e.g. `Jaipur;Claude;Kokoro`. Helps Whisper spell them right |
+| `DENOISE` | `auto` | `auto` = clean only noisy recordings and double-check unsure ones, `on` = always try the cleaned version first, `off` = never |
+| `SNR_CLEAN_DB` | `18` | Recordings cleaner than this are never noise-gated |
+| `RETRY_LOGPROB` | `-0.50` | If Whisper's confidence is below this, the other version of the recording is also tried |
+| `MAX_AUDIO_SECONDS` | `120` | Longest recording accepted (protects the 2 GiB memory limit) |
+| `TRIM_TTS` | `1` | Cuts silence at the start/end of speech, so replies start sooner and sound tighter |
+| `TTS_CACHE_MAX` | `64` | Number of recent spoken sentences kept in memory and replayed instantly. `0` turns it off |
 | `MP3_KBPS` | `48` | `64` = better sound, more data |
 | `VOICE_EN_FEMALE` / `VOICE_EN_MALE` | `af_heart` / `am_michael` | any Kokoro English id (`af_bella`, `bf_emma`, `am_adam` ...) |
 | `VOICE_HI_FEMALE` / `VOICE_HI_MALE` | `hf_alpha` / `hm_omega` | `hf_beta` / `hm_psi` |
@@ -112,7 +120,8 @@ Look at live timings in *Cloud Run → news-byte-extractor → Logs*. Every call
 | First sentence takes 15 to 30 s | Cold start. Open `/health` first (see the tip above). |
 | `401 Invalid API key` | The key in the extension differs from `.api_key`. |
 | `Container ... exceeded memory limit` in logs | Use Whisper `base`, or raise `--memory 3Gi` (more GiB-seconds used, still inside the free memory allowance if you use about 25 busy hours). |
-| Hindi words transcribed wrongly | Set *Language I speak* to **Hindi** or **Hinglish** instead of Automatic. |
+| Hindi words transcribed wrongly | Set *Language I speak* to **Hindi** or **Hinglish** instead of Automatic. Automatic now only chooses between English and Hindi, so it no longer mistakes Hindi for Urdu. |
+| Names / rare words spelled wrong | Set `WHISPER_HOTWORDS=Name1;Name2`, or send them in the extension's prompt field. |
 | Hindi reply sounds odd inside an English sentence | Hindi words in Roman letters ("aap kaise ho") are read with an English accent. Devanagari is read correctly. |
 | Silence from the speaker | Check the logs for `bad audio ... skipped`. The server never sends broken audio, and the extension falls back to a browser voice on an error. |
 
@@ -123,3 +132,42 @@ ordinary English sentences and was slower than fp32 on a modern Xeon.
 
 The service is public, but every speech request needs your API key (`Authorization: Bearer ...`).
 To rotate the key: delete `.api_key` and run `./deploy.sh` again. Put the new key in the extension.
+
+## Does 2 vCPU / 2 GiB work on Cloud Run? (checked Nov 2026)
+
+* **Allowed:** yes. Cloud Run services accept 2 vCPU with 128 MiB to 8 GiB of memory, so `--cpu 2 --memory 2Gi` is a valid pair. Startup CPU boost gives a 2-vCPU service 4 vCPU while starting.
+* **Free tier:** request-based billing gives 180,000 vCPU-seconds, 360,000 GiB-seconds and 2 million requests per month. Mumbai (`asia-south1`) is a Tier 1 region, so it gets the full free tier (Delhi `asia-south2` is Tier 2, so avoid it). At 2 vCPU that is 90,000 busy seconds (25 hours) a month; at 2 GiB the memory used for that is 180,000 GiB-seconds, inside the allowance.
+* **Memory is the tight part.** Measured here: Kokoro takes about 540 MB. The faster-whisper README lists `small` int8 at about 1.0 to 1.5 GB for a 13-minute file, and short voice clips use less. With Python itself, expect roughly 1.3 to 1.7 GiB in use. That fits in 2 GiB but with little spare room, which is why recordings are capped at 120 seconds. Watch *Cloud Run, Metrics, Memory utilization* after your first day. If it stays above about 85%, change `--memory 2Gi` to `3Gi` in `deploy.sh`. At 3 GiB a full 90,000 busy seconds is 270,000 GiB-seconds, still inside the free allowance.
+* **Not measured:** Whisper's own memory and speed on Cloud Run's CPU. I could not download Whisper from Hugging Face in my test environment, so those numbers come from the faster-whisper documentation, not from a run.
+
+## Noise: what the server does, and why it does not do more
+
+Heavy AI noise removers (RNNoise, DeepFilterNet) sound clean to people but usually make Whisper **less** accurate, because of the artefacts they leave. Published tests found this, so this server uses a gentle method instead (`audio_clean.py`, numpy only):
+
+1. Removes rumble below 70 Hz and lifts quiet microphones to a healthy level.
+2. Learns the steady background (fan, AC, hiss, mains hum) from the quietest part of the recording and turns it down by at most 10 dB. It never mutes it fully, so there is no "underwater" sound.
+3. Measures how noisy the recording is. Clean recordings are sent as they are. Noisy ones try the cleaned version first.
+4. If Whisper is unsure (low confidence) it listens again to the other version and keeps the more confident result. Clear speech never pays for this second pass.
+
+Test I ran (Whisper small.en int8, 4 synthetic English clips of 55 s in total, noise at 5 dB, word error rate, lower is better):
+
+| Noise | Untouched | High-pass only | Gate (used here) |
+|---|---|---|---|
+| none | 1.9% | 1.9% | 1.9% |
+| fan | 1.9% | 1.9% | 1.9% |
+| mains hum | 1.9% | 1.9% | 1.9% |
+| hiss | 2.5% | 2.6% | 1.9% |
+| people talking | 13.5% | 16.1% | 12.3% |
+
+Meaning: Whisper already copes well with steady noise, the gate never made things worse here and helped a little with hiss. The sample is small and the speech is synthetic, so treat it as a sanity check, not proof. **Other people talking nearby is the real problem** and no simple filter fixes it: use a headset or sit closer to the microphone.
+
+## What changed in build `voice-v4`
+
+* **Language detection** only chooses between English and Hindi (no more Hindi heard as Urdu).
+* **Quiet microphones** are normalised, silent recordings are skipped, and phantom phrases ("Thank you.") are filtered.
+* **Beam search 2**, retry at a higher temperature for garbled windows, padded voice detection so first/last words are not cut.
+* **Warm-up** now really runs Whisper, language detection and both voices at startup (the earlier warm-up used silence, which the new silence check would skip).
+* **Speech output:** silence trimmed, even loudness, emoji / `[links](url)` / `&` / `%` cleaned, repeated sentences cached.
+* `.api_key` is no longer uploaded with your source when deploying.
+
+**More accuracy, more cost (untested here):** in the `Dockerfile` set `ARG WHISPER_MODEL=large-v3-turbo`. It is a larger model, so expect more memory (raise `--memory`) and slower answers on 2 vCPU. Try it and read the `STT ... (x realtime)` log lines before keeping it.

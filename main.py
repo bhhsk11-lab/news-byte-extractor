@@ -17,10 +17,13 @@ import re
 import threading
 import time
 import wave
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 
 import lameenc
 import numpy as np
+
+import audio_clean as ac
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
@@ -35,8 +38,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 API_KEY = os.getenv("API_KEY", "").strip()                    # clients send  Authorization: Bearer <API_KEY>
 WHISPER_DIR = os.getenv("WHISPER_DIR", "/models/whisper")     # baked into the image (see Dockerfile)
 WHISPER_THREADS = int(os.getenv("WHISPER_THREADS", "2"))      # = number of vCPUs
-WHISPER_BEAM = int(os.getenv("WHISPER_BEAM", "1"))            # 1 = greedy = fastest. 2-5 = a little better, slower
+WHISPER_BEAM = int(os.getenv("WHISPER_BEAM", "2"))            # 1 = greedy = fastest. 2 = good balance. 3-5 = best, slower
 WHISPER_VAD = os.getenv("WHISPER_VAD", "1") == "1"            # drop silence: fewer "Thank you." hallucinations
+ALLOWED_LANGS = [x.strip() for x in re.split(r"[,;| ]+", os.getenv("ALLOWED_LANGS", "en,hi")) if x.strip()]  # auto-detect picks ONLY from these
+WHISPER_HOTWORDS = " ".join(re.split(r"[,;|]+", os.getenv("WHISPER_HOTWORDS", ""))).strip()  # optional: names / terms you say often, separated by spaces
+DENOISE = os.getenv("DENOISE", "auto").strip().lower()        # auto = clean only when the room is noisy, with a safety re-check | on | off
+SNR_CLEAN_DB = float(os.getenv("SNR_CLEAN_DB", "18"))          # recordings at or above this speech-to-noise ratio are never gated
+RETRY_LOGPROB = float(os.getenv("RETRY_LOGPROB", "-0.50"))     # below this confidence, the other audio version is tried too
+MAX_AUDIO_SECONDS = float(os.getenv("MAX_AUDIO_SECONDS", "120"))  # protects the 2 GiB memory limit
+TRIM_TTS = os.getenv("TRIM_TTS", "1") == "1"                  # cut dead air at the start/end of speech -> denser, snappier audio
+TTS_CACHE_MAX = int(os.getenv("TTS_CACHE_MAX", "64"))         # repeated sentences are served instantly
 KOKORO_MODEL = os.getenv("KOKORO_MODEL", "/models/kokoro.onnx")     # fp32 build. Do NOT use the int8 file: it outputs garbage
 KOKORO_VOICES = os.getenv("KOKORO_VOICES", "/models/voices.bin")
 KOKORO_THREADS = int(os.getenv("KOKORO_THREADS", "2"))
@@ -51,6 +62,7 @@ MALE_NAMES = {"cedar", "ash", "echo", "ballad", "verse", "onyx", "fable"}
 
 _stt = {"model": None}
 _tts = {"model": None, "voices": set()}
+_tts_cache: "OrderedDict" = OrderedDict()
 _stt_lock, _tts_lock = threading.Lock(), threading.Lock()     # one STT and one TTS job at a time -> predictable speed
 
 
@@ -76,8 +88,14 @@ def load_models():
 def warm_up():
     """One tiny job through each engine so the first real request is not slow."""
     try:
-        _transcribe_blocking(_silence_wav(), "en", "")
+        rng = np.random.default_rng(0)
+        probe = (0.05 * rng.standard_normal(16000 * 2)).astype(np.float32)   # not silence, so the encoder really runs
+        with _stt_lock:
+            _stt["model"].detect_language(probe)
+            list(_stt["model"].transcribe(probe, language="en", beam_size=WHISPER_BEAM, without_timestamps=True)[0])
+        ac.clean(probe)                                                       # warms numpy FFT paths too
         _synthesize_blocking("Hello.", EN_FEMALE, 1.0)
+        _synthesize_blocking("नमस्ते।", HI_FEMALE, 1.0)
         log.info("warm-up done")
     except Exception as e:  # never block startup because of the warm-up
         log.warning("warm-up skipped: %s", e)
@@ -151,7 +169,7 @@ def _silence_wav(sec=0.5, sr=16000) -> bytes:
 def _decode(data: bytes) -> np.ndarray:
     """Any audio the browser can record (webm/opus, ogg, mp4/m4a, mp3, wav) -> 16 kHz mono float32."""
     import av
-    chunks = []
+    chunks, total, cap = [], 0, int(MAX_AUDIO_SECONDS * 16000)
     with av.open(io.BytesIO(data), mode="r") as box:
         stream = next((x for x in box.streams if x.type == "audio"), None)
         if stream is None:
@@ -159,7 +177,11 @@ def _decode(data: bytes) -> np.ndarray:
         rs = av.AudioResampler(format="s16", layout="mono", rate=16000)
         for frame in box.decode(stream):
             for f in rs.resample(frame):
-                chunks.append(f.to_ndarray().reshape(-1))
+                a = f.to_ndarray().reshape(-1)
+                chunks.append(a)
+                total += a.size
+            if total > cap:
+                raise ValueError(f"recording is longer than {MAX_AUDIO_SECONDS:g} seconds")
         for f in rs.resample(None) or []:
             chunks.append(f.to_ndarray().reshape(-1))
     if not chunks:
@@ -168,31 +190,131 @@ def _decode(data: bytes) -> np.ndarray:
 
 
 def _lang_code(language: str):
-    """'en-IN' -> 'en', 'hi-IN' -> 'hi', '' / 'hinglish' / unknown -> None (auto-detect)."""
+    """'en-IN' -> 'en', 'hi-IN' -> 'hi', 'hinglish' -> 'hi', '' / 'auto' / unknown -> None (we detect it ourselves)."""
     code = (language or "").strip().lower().replace("_", "-").split("-")[0]
-    if code in ("hinglish", "auto", ""):
-        return "hi" if code == "hinglish" else None
+    if code == "hinglish":
+        return "hi"
+    if code in ("auto", ""):
+        return None
     return code if code in _stt["model"].supported_languages else None
+
+
+def _prepare(audio: np.ndarray) -> np.ndarray:
+    """Clean the recording before Whisper sees it: remove DC offset and lift quiet microphones to a healthy level.
+    Quiet / low-gain audio is a top cause of wrong words. Returns an empty array when there is no real sound."""
+    if audio.size == 0:
+        return audio
+    audio = audio - float(np.mean(audio))
+    peak = float(np.abs(audio).max())
+    if peak < 0.004:                                   # digital silence / pure noise floor
+        return audio[:0]
+    gain = min(0.85 / peak, 12.0)                      # peak-normalise, never boost more than 12x
+    if gain > 1.15:
+        audio = audio * gain
+    return np.clip(audio, -1.0, 1.0).astype(np.float32)
+
+
+def _detect_language(audio: np.ndarray):
+    """Whisper's own language guess is often wrong for Indian speech (Hindi heard as Urdu, English heard as Welsh...).
+    We look at its full probability table but only accept a language from ALLOWED_LANGS (default en, hi)."""
+    try:
+        _, _, probs = _stt["model"].detect_language(audio, vad_filter=WHISPER_VAD, language_detection_segments=2)
+        table = dict(probs)
+        pool = {k: table.get(k, 0.0) for k in ALLOWED_LANGS}
+        if pool:
+            best = max(pool, key=pool.get)
+            log.info("lang detect: %s", ", ".join(f"{k}={v:.2f}" for k, v in sorted(pool.items(), key=lambda kv: -kv[1])))
+            return best
+    except Exception as e:
+        log.warning("language detection skipped: %s", e)
+    return None
+
+
+# Phrases Whisper invents out of silence / noise. Dropped only when the segment is also low-confidence.
+_HALLUCINATIONS = {
+    "thank you", "thanks", "thank you.", "thanks for watching", "thank you for watching", "bye", "bye.", "you",
+    "subtitles by the amara.org community", "please subscribe", "like and subscribe",
+    "धन्यवाद", "शुक्रिया", "थैंक यू", "देखने के लिए धन्यवाद", "सब्सक्राइब करें",
+}
+
+
+def _is_hallucination(seg) -> bool:
+    t = re.sub(r"[\s.!,?।]+$", "", seg.text.strip().lower())
+    weak = seg.no_speech_prob > 0.35 or seg.avg_logprob < -0.9
+    return weak and t in _HALLUCINATIONS
+
+
+def _run_whisper(audio: np.ndarray, lang, prompt: str):
+    """One Whisper pass. Returns (text, confidence, info). Confidence = average token log-probability (closer to 0 = surer)."""
+    segs, info = _stt["model"].transcribe(
+        audio,
+        language=lang,
+        task="transcribe",
+        beam_size=WHISPER_BEAM, best_of=3,            # best_of only matters in the temperature fallback below
+        temperature=(0.0, 0.2, 0.4),                  # retry a failed / garbled window at a higher temperature
+        condition_on_previous_text=False,             # short utterances: stops repetition loops
+        initial_prompt=(prompt or None),
+        hotwords=(WHISPER_HOTWORDS or None),
+        vad_filter=WHISPER_VAD,
+        vad_parameters={"threshold": 0.45, "min_silence_duration_ms": 350,
+                        "speech_pad_ms": 250, "min_speech_duration_ms": 120},   # pad = never clip the first / last word
+        without_timestamps=True,                      # faster decoding, we only need text
+        no_speech_threshold=0.6,
+        log_prob_threshold=-1.0,
+        compression_ratio_threshold=2.2,              # catches "the the the the" loops
+        repetition_penalty=1.05,
+        no_repeat_ngram_size=0,
+        suppress_blank=True,
+    )
+    texts, lp, wt = [], 0.0, 0
+    for sg in segs:
+        t = sg.text.strip()
+        if not t or _is_hallucination(sg):
+            continue
+        texts.append(t)
+        w = max(1, len(sg.tokens or ()))
+        lp += sg.avg_logprob * w
+        wt += w
+    text = re.sub(r"\s+", " ", " ".join(texts)).strip()
+    return text, (lp / wt if wt else -9.0), info
+
+
+def _audio_versions(audio: np.ndarray):
+    """The recording in the order we should try it: [(name, audio), ...]. See README 'Noise' for the reasoning."""
+    snr = ac.estimate_snr_db(audio)
+    plain = ac.clean(audio, gate=False)                       # high-pass only: safe for every recording
+    if DENOISE == "off":
+        return snr, [("plain", plain)]
+    gated = ac.clean(audio, gate=True)                        # + soft gate for steady background noise
+    if DENOISE == "on":
+        return snr, [("gated", gated), ("plain", plain)]
+    return snr, ([("plain", plain), ("gated", gated)] if snr >= SNR_CLEAN_DB else [("gated", gated), ("plain", plain)])
 
 
 def _transcribe_blocking(data: bytes, language: str, prompt: str):
     t0 = time.time()
-    audio = _decode(data)
+    audio = _prepare(_decode(data))
+    if audio.size < 1600:                              # < 0.1 s or silence: nothing to transcribe
+        log.info("STT skipped: no speech in recording")
+        return ""
+    lang = _lang_code(language)
     with _stt_lock:
-        segs, info = _stt["model"].transcribe(
-            audio,
-            language=_lang_code(language),
-            beam_size=WHISPER_BEAM, best_of=1,
-            temperature=0.0,
-            condition_on_previous_text=False,       # short utterances: no need, and it stops repetition loops
-            initial_prompt=(prompt or None),
-            vad_filter=WHISPER_VAD,
-            vad_parameters={"min_silence_duration_ms": 400},
-            no_speech_threshold=0.6,
-        )
-        text = " ".join(s.text.strip() for s in segs).strip()
+        if lang is None:
+            lang = _detect_language(audio)
+        snr, versions = _audio_versions(audio)
+        name, ver = versions[0]
+        text, conf, info = _run_whisper(ver, lang, prompt)
+        used = name
+        # Not sure about the result (or nothing heard)? Listen once more to the other version of the same recording and
+        # keep whichever Whisper is more confident about. Costs time only on hard recordings; clear speech never pays it.
+        if len(versions) > 1 and (conf < RETRY_LOGPROB or not text) and audio.size < 20 * 16000:
+            name2, ver2 = versions[1]
+            text2, conf2, _ = _run_whisper(ver2, lang, prompt)
+            if text2 and (not text or conf2 > conf + 0.05):
+                text, conf, used = text2, conf2, name2
     dt = time.time() - t0
-    log.info("STT %.1fs audio in %.2fs (x%.1f realtime) lang=%s: %s", info.duration, dt, info.duration / max(dt, 1e-3), info.language, text[:80])
+    log.info("STT %.1fs audio in %.2fs (x%.1f) lang=%s snr=%.0fdB used=%s conf=%.2f: %s",
+             info.duration, dt, info.duration / max(dt, 1e-3), lang or info.language, snr, used, conf, text[:80])
     return text
 
 
@@ -227,12 +349,26 @@ async def transcriptions(
 _DEV = re.compile(r"[\u0900-\u097F]")
 _URL = re.compile(r"https?://\S+")
 _MD = re.compile(r"[*_`#>~|]+")
+_EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200d]+")
+_BRACKETS = re.compile(r"\[([^\]]*)\]\([^)]*\)")       # [label](url) -> label
 
 
 def _clean(text: str) -> str:
+    text = _BRACKETS.sub(r"\1", text)
     text = _URL.sub(" link ", text)
+    text = _EMOJI.sub(" ", text)
     text = _MD.sub(" ", text)
+    text = text.replace("&", " and ").replace("%", " percent ")
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _trim(audio: np.ndarray, sr: int, thr: float = 0.006, keep_ms: int = 60) -> np.ndarray:
+    """Cut dead air at both ends of a rendered chunk."""
+    loud = np.flatnonzero(np.abs(audio) > thr)
+    if loud.size == 0:
+        return audio
+    pad = sr * keep_ms // 1000
+    return audio[max(0, loud[0] - pad): loud[-1] + pad]
 
 
 def _script_runs(text: str):
@@ -287,10 +423,14 @@ def _synthesize_blocking(text: str, voice: str, speed: float):
             if len(audio) < sr // 20 or not np.isfinite(audio).all() or float(np.abs(audio).max()) > 1.5:
                 log.warning("bad audio for chunk %r (len=%d) - skipped", chunk[:30], len(audio))
                 continue
-            parts.append(audio)
+            parts.append(_trim(audio, sr) if TRIM_TTS else audio)
     if not parts:
         raise SynthFailed("The voice model produced no usable audio for this text.")
-    audio = np.concatenate(parts).astype(np.float32)
+    gap = np.zeros(sr * 70 // 1000, dtype=np.float32)          # short, even pause between chunks
+    audio = np.concatenate([x for p in parts for x in (p, gap)][:-1]).astype(np.float32)
+    peak = float(np.abs(audio).max())
+    if 0 < peak < 0.9:                                         # even loudness from call to call
+        audio = audio * min(0.92 / peak, 1.6)
     dt = time.time() - t0
     log.info("TTS %.1fs audio in %.2fs (x%.1f realtime) voice=%s", len(audio) / sr, dt, len(audio) / sr / max(dt, 1e-3), voice)
     return audio, sr
@@ -333,13 +473,22 @@ async def speech(req: SpeechRequest, _: None = Depends(auth)):
         raise HTTPException(400, "Empty input.")
     voice = _pick_voice(req.voice or "", text)
     speed = min(2.0, max(0.5, float(req.speed or 1.0)))
+    fmt = "wav" if (req.response_format or "mp3").lower() == "wav" else "mp3"
+    key = (text, voice, round(speed, 2), fmt)
+    hit = _tts_cache.get(key)
+    if hit is not None:
+        _tts_cache.move_to_end(key)
+        return Response(hit, media_type="audio/wav" if fmt == "wav" else "audio/mpeg")
     try:
         audio, sr = await run_in_threadpool(_synthesize_blocking, text, voice, speed)
     except SynthFailed as e:
         raise HTTPException(500, str(e))      # 5xx -> the extension retries / falls back to a browser voice
-    if (req.response_format or "mp3").lower() == "wav":
-        return Response(_to_wav(audio, sr), media_type="audio/wav")
-    return Response(await run_in_threadpool(_to_mp3, audio, sr), media_type="audio/mpeg")
+    body = await run_in_threadpool(_to_wav if fmt == "wav" else _to_mp3, audio, sr)
+    if TTS_CACHE_MAX > 0 and len(body) < 2_000_000:
+        _tts_cache[key] = body
+        while len(_tts_cache) > TTS_CACHE_MAX:
+            _tts_cache.popitem(last=False)
+    return Response(body, media_type="audio/wav" if fmt == "wav" else "audio/mpeg")
 
 
 # ------------------------------------------------------------------ misc
@@ -354,4 +503,4 @@ async def voices(_: None = Depends(auth)):
 async def health():
     return {"ok": _ready.is_set(), "loading": not _ready.is_set() and not _boot["error"], "error": _boot["error"],
             "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": os.path.basename(WHISPER_DIR.rstrip("/")),
-            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "stt-decode-v2"}
+            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v4", "beam": WHISPER_BEAM, "langs": ALLOWED_LANGS}

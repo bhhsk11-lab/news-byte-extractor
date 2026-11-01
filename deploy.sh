@@ -35,7 +35,7 @@ gcloud run deploy "$SERVICE" \
   --cpu 2 --memory 2Gi --cpu-boost \
   --min-instances 0 --max-instances 1 --concurrency 4 \
   --timeout 120 --allow-unauthenticated --labels app=cpu-voice \
-  --update-env-vars "API_KEY=${API_KEY},WHISPER_THREADS=2,KOKORO_THREADS=2"
+  --update-env-vars "API_KEY=${API_KEY},WHISPER_THREADS=2,KOKORO_THREADS=2,WHISPER_BEAM=2"
 
 URL="$(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format 'value(status.url)')"
 cat <<MSG
