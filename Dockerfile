@@ -1,30 +1,30 @@
-FROM python:3.11-slim
+# CPU voice server (Whisper STT + Kokoro TTS) for Cloud Run.
+# Models are downloaded at BUILD time and baked into the image, so a cold start only loads files from disk.
+FROM python:3.12-slim
 
-ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 HF_HUB_DISABLE_TELEMETRY=1
 
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
-    libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
-    libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 \
-    libcairo2 libatspi2.0-0 libx11-6 libxcb1 libxext6 \
-    libglib2.0-0 libdbus-1-3 libxshmfence1 libgtk-3-0 \
-    libu2f-udev libvulkan1 libexpat1 xdg-utils \
-    fonts-liberation fonts-unifont fonts-freefont-ttf \
-    fonts-noto-color-emoji fonts-wqy-zenhei \
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install chromium
+RUN pip install -r requirements.txt
 
-COPY app.py google_resolver.py README.md extension-example.js ./
-RUN python -m py_compile app.py google_resolver.py
-RUN useradd --create-home --uid 1000 user && chown -R user:user /app /ms-playwright
-USER user
-EXPOSE 10000
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1"]
+# ---- speech-to-text model --------------------------------------------------------------
+# small  = good English + usable Hindi, ~1 GB RAM       <- default
+# base   = faster, weaker Hindi, ~0.5 GB RAM
+# medium = much better Hindi, but too slow on 2 vCPU for live talking
+ARG WHISPER_MODEL=small
+RUN python -c "from faster_whisper import download_model; download_model('${WHISPER_MODEL}', output_dir='/models/whisper')"
+
+# ---- text-to-speech model (Kokoro-82M, English + Hindi) --------------------------------
+# Use the full fp32 file. The int8 file is smaller but returns broken audio (NaN) on ordinary sentences.
+RUN mkdir -p /models \
+    && curl -fL --retry 3 -o /models/kokoro.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx \
+    && curl -fL --retry 3 -o /models/voices.bin  https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+
+COPY main.py .
+
+# One worker: the models live in memory once. Cloud Run scales by adding instances, not workers.
+CMD exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1
