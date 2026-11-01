@@ -148,6 +148,25 @@ def _silence_wav(sec=0.5, sr=16000) -> bytes:
     return b.getvalue()
 
 
+def _decode(data: bytes) -> np.ndarray:
+    """Any audio the browser can record (webm/opus, ogg, mp4/m4a, mp3, wav) -> 16 kHz mono float32."""
+    import av
+    chunks = []
+    with av.open(io.BytesIO(data), mode="r") as box:
+        stream = next((x for x in box.streams if x.type == "audio"), None)
+        if stream is None:
+            raise ValueError("no audio track in this file")
+        rs = av.AudioResampler(format="s16", layout="mono", rate=16000)
+        for frame in box.decode(stream):
+            for f in rs.resample(frame):
+                chunks.append(f.to_ndarray().reshape(-1))
+        for f in rs.resample(None) or []:
+            chunks.append(f.to_ndarray().reshape(-1))
+    if not chunks:
+        raise ValueError("the recording is empty")
+    return np.concatenate(chunks).astype(np.float32) / 32768.0
+
+
 def _lang_code(language: str):
     """'en-IN' -> 'en', 'hi-IN' -> 'hi', '' / 'hinglish' / unknown -> None (auto-detect)."""
     code = (language or "").strip().lower().replace("_", "-").split("-")[0]
@@ -158,9 +177,10 @@ def _lang_code(language: str):
 
 def _transcribe_blocking(data: bytes, language: str, prompt: str):
     t0 = time.time()
+    audio = _decode(data)
     with _stt_lock:
         segs, info = _stt["model"].transcribe(
-            io.BytesIO(data),
+            audio,
             language=_lang_code(language),
             beam_size=WHISPER_BEAM, best_of=1,
             temperature=0.0,
@@ -198,7 +218,7 @@ async def transcriptions(
     except HTTPException:
         raise
     except Exception as e:
-        log.exception("transcription failed")
+        log.exception("transcription failed (%d bytes, type %s)", len(data), file.content_type)
         raise HTTPException(422, f"Could not read this audio: {e}")
     return PlainTextResponse(text) if response_format == "text" else {"text": text}
 
@@ -334,4 +354,4 @@ async def voices(_: None = Depends(auth)):
 async def health():
     return {"ok": _ready.is_set(), "loading": not _ready.is_set() and not _boot["error"], "error": _boot["error"],
             "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": os.path.basename(WHISPER_DIR.rstrip("/")),
-            "tts": "kokoro-82m", "auth": bool(API_KEY)}
+            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "stt-decode-v2"}
