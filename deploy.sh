@@ -5,7 +5,7 @@ set -euo pipefail
 
 PROJECT="${1:-$(gcloud config get-value project 2>/dev/null)}"
 REGION="${REGION:-asia-south1}"          # Mumbai: closest to India, and full free tier (Tier 1 pricing)
-SERVICE="${SERVICE:-voice-server}"
+SERVICE="${SERVICE:-news-byte-extractor}"
 KEY_FILE=".api_key"
 
 [ -n "$PROJECT" ] || { echo "Pass your project id:  ./deploy.sh my-project-id"; exit 1; }
@@ -17,7 +17,8 @@ fi
 API_KEY="$(cat "$KEY_FILE")"
 
 # never silently overwrite one of your other services
-if gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
+LABEL="$(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format 'value(metadata.labels.app)' 2>/dev/null || true)"
+if gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" >/dev/null 2>&1 && [ "$LABEL" != "cpu-voice" ]; then
   echo "A Cloud Run service named '$SERVICE' already exists in $REGION. Deploying will replace its image and settings."
   read -r -p "Continue? [y/N] " yn; [[ "$yn" =~ ^[Yy]$ ]] || { echo "Cancelled. Use a different name:  SERVICE=my-voice ./deploy.sh"; exit 1; }
 fi
@@ -33,7 +34,7 @@ gcloud run deploy "$SERVICE" \
   --project "$PROJECT" --region "$REGION" --source . \
   --cpu 2 --memory 2Gi --cpu-boost \
   --min-instances 0 --max-instances 1 --concurrency 4 \
-  --timeout 120 --allow-unauthenticated \
+  --timeout 120 --allow-unauthenticated --labels app=cpu-voice \
   --update-env-vars "API_KEY=${API_KEY},WHISPER_THREADS=2,KOKORO_THREADS=2"
 
 URL="$(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format 'value(status.url)')"

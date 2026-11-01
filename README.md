@@ -17,7 +17,7 @@ The extension already speaks the OpenAI speech API, so **no extension changes ar
 1. Open **Google Cloud Shell** (the `>_` icon in the Cloud Console). It already has `gcloud` logged in.
 2. Upload this folder (Cloud Shell menu `⋮` → *Upload*) and open it:
    ```bash
-   unzip voice-server.zip -d voice-server && cd voice-server
+   unzip news-byte-extractor.zip -d news-byte-extractor && cd news-byte-extractor
    ```
 3. Deploy:
    ```bash
@@ -32,7 +32,7 @@ tier, and it is the closest region to Jaipur. Change it with `REGION=... ./deplo
 ## 2. Test it (before touching the extension)
 
 ```bash
-URL=https://voice-server-xxxxx-el.a.run.app      # printed by deploy.sh
+URL=https://news-byte-extractor-xxxxx-el.a.run.app      # printed by deploy.sh
 KEY=$(cat .api_key)
 
 curl $URL/health                                  # first call wakes the server: 15-30 s, then instant
@@ -50,7 +50,7 @@ Extension popup → **Speech engines & images**:
 
 | Field | Value |
 |---|---|
-| Speech & image API base URL | `https://voice-server-xxxxx-el.a.run.app/v1` (keep the `/v1`) |
+| Speech & image API base URL | `https://news-byte-extractor-xxxxx-el.a.run.app/v1` (keep the `/v1`) |
 | Speech & image API key | the key from `.api_key` |
 | Speech input (your microphone) | **API** |
 | Transcription model | anything (for example `whisper-small`). The server ignores it |
@@ -86,7 +86,7 @@ Things that are **not** free, and what to do:
 
 ## Tuning
 
-Change these with `gcloud run services update voice-server --region asia-south1 --update-env-vars NAME=value`:
+Change these with `gcloud run services update news-byte-extractor --region asia-south1 --update-env-vars NAME=value`:
 
 | Setting | Default | When to change |
 |---|---|---|
@@ -101,14 +101,14 @@ Changing the **Whisper model** needs a rebuild: edit `ARG WHISPER_MODEL=small` i
 * `small`: the default.
 * `medium`: clearly better Hindi, but too slow for live talking on 2 vCPU, and it may not fit in 2 GiB next to the voice model.
 
-Look at live timings in *Cloud Run → voice-server → Logs*. Every call logs a line like
+Look at live timings in *Cloud Run → news-byte-extractor → Logs*. Every call logs a line like
 `STT 4.1s audio in 1.9s (x2.2 realtime)`. A figure above 1.0 means faster than real time.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| Deploy fails with "failed to start and listen on PORT" | Read the logs: `gcloud run services logs read voice-server --region asia-south1 --limit 60`. Look for `MODEL LOADING FAILED`. `/health` also shows the error text. |
+| Deploy fails with "failed to start and listen on PORT" | Read the logs: `gcloud run services logs read news-byte-extractor --region asia-south1 --limit 60`. Look for `MODEL LOADING FAILED`. `/health` also shows the error text. |
 | First sentence takes 15 to 30 s | Cold start. Open `/health` first (see the tip above). |
 | `401 Invalid API key` | The key in the extension differs from `.api_key`. |
 | `Container ... exceeded memory limit` in logs | Use Whisper `base`, or raise `--memory 3Gi` (more GiB-seconds used, still inside the free memory allowance if you use about 25 busy hours). |
