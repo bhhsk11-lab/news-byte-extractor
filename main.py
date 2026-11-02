@@ -47,9 +47,14 @@ STT_THREADS = int(os.getenv("STT_THREADS", "2"))               # = number of vCP
 STT_WORKERS = max(1, int(os.getenv("STT_WORKERS", str(max(1, min(2, STT_THREADS))))))  # recordings transcribed AT THE SAME TIME
 if STT_BACKEND == "redux":
     STT_WORKERS = 1        # Photon's thread-safety is not documented: one recording at a time, the rest wait in the queue (also saves RAM)
-VAD_MODE = os.getenv("VAD_MODE", "energy" if STT_BACKEND == "redux" else "neural").strip().lower()     # neural = Silero VAD network (falls back to energy if it cannot load) | energy = simple loudness rule
-VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))       # Silero speech probability needed to count as speech (0.3 = more sensitive, 0.7 = stricter)
+VAD_MODE = os.getenv("VAD_MODE", "neural").strip().lower()     # neural = Silero VAD network (falls back to energy if it cannot load) | energy = simple loudness rule
+VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.4"))       # Silero speech probability needed to count as speech (0.3 = more sensitive, 0.7 = stricter)
 STT_SEPARATE_COPIES = os.getenv("STT_SEPARATE_COPIES", "0") == "1"  # 0 = all workers share ONE loaded model (about 1.2 GB). 1 = one model per worker (safest, +1.2 GB each)
+LEVELER = os.getenv("LEVELER", "1") == "1"                       # even out the loudness BEFORE the voice detector, so quiet sentences are not skipped
+TARGET_DBFS = float(os.getenv("TARGET_DBFS", "-20"))            # every speech piece is set to this level (dB below full scale) before decoding
+MAX_GAIN_DB = float(os.getenv("MAX_GAIN_DB", "40"))             # most a quiet passage may be lifted
+PIECE_MAX_S = float(os.getenv("PIECE_MAX_S", "12"))             # speech is decoded in pieces of at most this many seconds, cut at pauses (long windows lose sentences)
+RETRY_DROPS = os.getenv("RETRY_DROPS", "1") == "1"              # decode a piece a second time (with quiet edges) when it looks like words were lost
 STT_QUEUE_MAX = int(os.getenv("STT_QUEUE_MAX", "8"))           # more than this many recordings waiting -> HTTP 429 (client retries) instead of a long hang
 TTS_WORKERS = max(1, int(os.getenv("TTS_WORKERS", "1")))       # sentences spoken at the same time (each copy of Kokoro needs ~0.55 GB RAM)
 MAX_AUDIO_SECONDS = float(os.getenv("MAX_AUDIO_SECONDS", "120"))  # protects the memory limit
@@ -105,6 +110,7 @@ class Pool:
 
 
 _stt = {"pool": None}
+_stats = {"recovered": 0}
 _tts = {"pool": None, "voices": set()}
 _tts_cache: "OrderedDict" = OrderedDict()
 
@@ -289,18 +295,21 @@ def _decode(data: bytes) -> np.ndarray:
 
 
 def _prepare(audio: np.ndarray) -> np.ndarray:
-    """Clean the recording before Parakeet hears it: remove DC offset and lift quiet microphones to a healthy level.
-    Quiet / low-gain audio is a top cause of wrong words. Returns an empty array when there is no real sound."""
+    """Clean the recording before the voice detector and the speech model: remove DC offset and rumble (high-pass, no denoiser: published
+    tests show denoising networks make Parakeet/Whisper worse), then even out the loudness so quiet sentences are as strong as loud ones.
+    Returns an empty array when there is no real sound."""
     if audio.size == 0:
         return audio
     audio = audio - float(np.mean(audio))
-    peak = float(np.abs(audio).max())
-    if peak < 0.004:                                   # digital silence / pure noise floor
+    if float(np.abs(audio).max()) < 0.0005:           # digital silence (below -66 dBFS)
         return audio[:0]
-    gain = min(0.85 / peak, 12.0)                      # peak-normalise, never boost more than 12x
-    if gain > 1.15:
-        audio = audio * gain
-    return np.clip(audio, -1.0, 1.0).astype(np.float32)
+    audio = ac.clean(audio, gate=False)                # high-pass only (about 40-80 Hz)
+    if LEVELER:
+        audio = ac.level(audio, target_db=TARGET_DBFS, max_gain_db=MAX_GAIN_DB)
+    else:
+        peak = float(np.abs(audio).max())
+        audio = np.clip(audio * min(0.85 / max(peak, 1e-6), 12.0), -1.0, 1.0)
+    return audio.astype(np.float32)
 
 
 def _sherpa_decode(rec, audio: np.ndarray) -> str:
@@ -316,6 +325,23 @@ def _stt_decode(rec, audio: np.ndarray) -> str:
         res = rec.transcribe(audio=audio, sample_rate=16000, timestamps="none")   # Photon splits >30 s audio at pauses by itself
         return (res.get("text", "") if isinstance(res, dict) else str(res)).strip()
     return _sherpa_decode(rec, audio)
+
+
+def _decode_piece(rec, piece: np.ndarray) -> str:
+    """Decode one speech piece. Parakeet-type models sometimes return nothing, or only part of a piece, without any error.
+    When the result looks too short for the length of the piece, decode it once more with faint noise on both edges and keep
+    whichever result has more words."""
+    text = _stt_decode(rec, piece)
+    if not RETRY_DROPS:
+        return text
+    dur, words = len(piece) / 16000, len(text.split())
+    if (words == 0 and dur >= 0.6) or (dur >= 4.0 and words / dur < 0.6):
+        again = _stt_decode(rec, ac.pad_edges(piece))
+        if len(again.split()) > words:
+            log.info("STT retry recovered words: %d -> %d in a %.1fs piece", words, len(again.split()), dur)
+            _stats["recovered"] += 1
+            return again
+    return text
 
 
 def _energy_segments(audio: np.ndarray):
@@ -346,7 +372,7 @@ def _neural_segments(audio: np.ndarray):
         cfg.silero_vad.threshold = VAD_THRESHOLD
         cfg.silero_vad.min_silence_duration = 0.5        # pauses shorter than this stay inside one piece (sentences are not chopped)
         cfg.silero_vad.min_speech_duration = 0.15
-        cfg.silero_vad.max_speech_duration = 20.0        # very long speech is cut by the network at a pause
+        cfg.silero_vad.max_speech_duration = PIECE_MAX_S   # long speech is cut by the network at a pause
         cfg.sample_rate = 16000
         cfg.num_threads = 1
         cfg.provider = "cpu"
@@ -380,8 +406,9 @@ def _speech_pieces(audio: np.ndarray):
     return _energy_segments(audio)
 
 
-def _split_long(audio: np.ndarray, max_s: float = 20.0):
-    """Cut long recordings into pieces of at most ~20 s, always at the quietest moment (never mid-word)."""
+def _split_long(audio: np.ndarray, max_s: float = 0.0):
+    """Cut long recordings into pieces of at most PIECE_MAX_S, always at the quietest moment (never mid-word)."""
+    max_s = max_s or PIECE_MAX_S
     n, k = int(max_s * 16000), 1600
     out, start = [], 0
     while len(audio) - start > n:
@@ -397,7 +424,7 @@ def _split_long(audio: np.ndarray, max_s: float = 20.0):
 def _transcribe_blocking(data: bytes, prompt: str = ""):
     t0 = time.time()
     raw = _decode(data)
-    qual = ac.describe(ac.stats(raw))                  # what the browser really sent (before our own level boost)
+    qual = ac.describe(ac.stats(raw))                  # what the browser really sent (before our own leveling)
     audio = _prepare(raw)
     if audio.size < 1600:
         log.info("STT skipped: no speech in recording")
@@ -407,12 +434,12 @@ def _transcribe_blocking(data: bytes, prompt: str = ""):
     if not pieces:
         log.info("STT skipped: only noise, no speech")
         return ""
-    audio = np.concatenate(pieces)                     # only used for the length in the log line below
+    pieces = [ac.normalize_piece(sub, target_db=TARGET_DBFS) for piece in pieces for sub in _split_long(piece) if len(sub) > 1600]
+    audio = np.concatenate(pieces) if pieces else audio[:0]    # only used for the length in the log line below
+    if audio.size == 0:
+        return ""
     with _stt["pool"].take() as rec:                   # waits here when all workers are busy
-        if STT_BACKEND == "redux":                     # Redux has its own VAD + chunking (<=30 s at pauses): hand it the whole speech span
-            text = _stt_decode(rec, audio) if len(audio) > 1600 else ""
-        else:
-            text = " ".join(_stt_decode(rec, sub) for piece in pieces for sub in _split_long(piece) if len(sub) > 1600)
+        text = " ".join(_decode_piece(rec, sub) for sub in pieces)
     text = re.sub(r"\s+", " ", text).strip()
     dt = time.time() - t0
     log.info("STT[%s] %.1fs audio in %.2fs (x%.1f) %s: %s", STT_ENGINE, len(audio) / 16000, dt, len(audio) / 16000 / max(dt, 1e-3), qual, text[:80])
@@ -608,6 +635,6 @@ async def voices(_: None = Depends(auth)):
 async def health():
     return {"ok": _ready.is_set(), "loading": not _ready.is_set() and not _boot["error"], "error": _boot["error"],
             "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": STT_ENGINE,
-            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v13-moondream-redux", "engine": STT_ENGINE, "lang": "en" if STT_BACKEND == "sherpa" else "auto", "vad": VAD_MODE,
-            "stt_workers": STT_WORKERS, "stt_busy": _stt["pool"].active if _stt["pool"] else 0, "stt_waiting": _stt["pool"].waiting if _stt["pool"] else 0,
+            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v14-moondream-redux-leveler", "engine": STT_ENGINE, "lang": "en" if STT_BACKEND == "sherpa" else "auto", "vad": VAD_MODE,
+            "stt_recovered": _stats["recovered"], "target_dbfs": TARGET_DBFS if LEVELER else None, "stt_workers": STT_WORKERS, "stt_busy": _stt["pool"].active if _stt["pool"] else 0, "stt_waiting": _stt["pool"].waiting if _stt["pool"] else 0,
             "tts_workers": TTS_WORKERS}

@@ -94,7 +94,13 @@ Change these with `gcloud run services update news-byte-extractor --region asia-
 | `STT_WORKERS` | `1` | Recordings transcribed at the same moment. Redux always uses 1 |
 | `STT_SEPARATE_COPIES` | `0` | `0` = the workers share ONE loaded Parakeet (about 1.2 GB). `1` = one Parakeet per worker (+1.2 GB each, needs `MEMORY=5Gi`) |
 | `STT_THREADS` | `2` | CPU threads for speech-to-text (`deploy.sh` sets it from `CPU`) |
-| `VAD_MODE` | `energy` (redux) / `neural` (sherpa) | Redux has its own voice detection and cuts at pauses (max 30 s), so the server only uses the loudness rule to skip empty recordings. `neural` = Silero VAD, only for the sherpa backend |
+| `VAD_MODE` | `neural` | `neural` = Silero VAD network, `energy` = simple loudness rule (also the automatic fallback) |
+| `VAD_THRESHOLD` (see below) | `0.4` | lowered from 0.5 so soft speech is kept |
+| `LEVELER` | `1` | Evens out loudness before the voice detector (see "Level control"). `0` = old peak-normalise |
+| `TARGET_DBFS` | `-20` | Level every speech piece is set to, in dB below full scale |
+| `MAX_GAIN_DB` | `40` | Most a quiet passage may be lifted |
+| `PIECE_MAX_S` | `12` | Longest piece sent to the model; longer speech is cut at pauses |
+| `RETRY_DROPS` | `1` | Decode a piece a second time when it looks like words were lost |
 | `VAD_THRESHOLD` | `0.5` | Speech probability needed to count as speech. `0.3` if quiet speech is cut, `0.7` if noise gets through |
 | `STT_QUEUE_MAX` | `8` | If more recordings than this are waiting, the server answers HTTP 429 instead of hanging |
 | `MAX_AUDIO_SECONDS` | `120` | Longest recording accepted |
@@ -104,22 +110,33 @@ Change these with `gcloud run services update news-byte-extractor --region asia-
 | `MP3_KBPS` | `48` | `64` = better sound, more data |
 | `VOICE_EN_FEMALE` / `VOICE_EN_MALE` | `af_heart` / `am_michael` | any Kokoro English id |
 
-## Speech-to-text: Moondream Parakeet Redux (build `voice-v13-moondream-redux`)
+## Speech-to-text: Moondream Parakeet Redux (build `voice-v14-moondream-redux-leveler`)
 
 * Default model: **moondream/parakeet-redux**, run on CPU with `moondream.photon(..., device="cpu")`. It is NVIDIA's Parakeet 0.6B **v3** with the encoder weights reduced to -1/0/+1; weights shrink from 1.2 GB to 178 MB (per Moondream's release post, Sep 2026).
 * **Not English only.** It supports 25 languages and detects the language automatically. If someone speaks another language the server will transcribe that language. The old English-only v2 model is still available with `STT_BACKEND=sherpa`.
 * Accuracy, from Moondream's own tests (not run here): English average word error 6.55% (original v3: 6.26%); with background noise 9.04% (original: 6.72%). Redux is weaker in noise, so keep the microphone close and the room quiet. The README of the previous build quoted about 6.0% for v2 on a different benchmark, so those numbers cannot be compared directly.
-* Long recordings: Photon splits audio at pauses into chunks of at most 30 s. The server therefore sends the whole speech span in one call. Silero VAD is not used with Redux.
+* Long recordings: the server cuts speech at pauses (Silero VAD) into pieces of at most 12 s and decodes each piece alone (see "Level control and lost sentences").
 * **Memory is not measured yet.** The logs print `MEMORY after STT load`, `after TTS load` and `after warm-up`: read them on the first deploy. Kokoro fp32 alone is about 0.55 GB, so 1 GiB total is tight. If Cloud Run reports `exceeded memory limit`, deploy with `MEMORY=2Gi`.
 * **Not tested here:** this build was written without network access, so the Photon calls (`md.photon`, `transcribe(audio=ndarray, sample_rate=16000, timestamps="none")`) follow Moondream's documentation but have not been run. Photon's own dependencies (for example whether it pulls in PyTorch, which would make the image much bigger and use more RAM) are also unchecked: look at the build log and the image size.
 * The model is loaded once at build time into the image (`fetch_stt.py`). If that download fails the build continues with a warning and the server downloads the weights at first start (slow cold start).
 * One recording is transcribed at a time (Photon's thread-safety is not documented); the others wait in the queue (`STT_QUEUE_MAX`).
 * **License:** CC-BY-4.0, same as NVIDIA's Parakeet. Keep the attribution: "Moondream Parakeet Redux, based on NVIDIA Parakeet TDT 0.6B v3". Check the Photon engine license on moondream.ai/photon before commercial use.
-* `/health` shows `"build": "voice-v13-moondream-redux"` and `"stt": "moondream-parakeet-redux"`.
+* `/health` shows `"build": "voice-v14-moondream-redux-leveler"` and `"stt": "moondream-parakeet-redux"`.
 
 ### Going back to the old model
 
 Set `ARG STT_BACKEND=sherpa` in the Dockerfile and deploy with `MEMORY=3Gi ./deploy.sh`. The sections below about Silero VAD, 1.2-1.65 GB memory and two workers describe that backend.
+
+## Level control and lost sentences (build `voice-v14`)
+
+What the internet check (Nov 2026) found, and what was done:
+
+* **Why quiet sentences vanish.** The speech model itself is fairly level-independent (it normalises its features per recording). What skips quiet sentences is everything in front of it: the silence gate, the voice detector and "loud enough" rules. The old energy rule dropped anything about 22 dB below the loudest moment. Fix: a slow automatic gain control (`audio_clean.level`) lifts quiet passages up to +40 dB (and lowers very loud ones by up to 12 dB) BEFORE the voice detector, then each speech piece is set to the same level (`normalize_piece`). Synthetic test: sentences at -10, -30 and -52 dBFS all reached the model at -20 dBFS. Background-only audio is not boosted on its own. A research paper on gain control also warns that badly chosen gain raises word errors, so the gain is smooth (about 0.2 s), has a ceiling, and a soft limiter instead of hard clipping.
+* **"50 dB".** A recording has no absolute sound pressure: dB SPL depends on the microphone and the room. The equivalent here is a fixed digital level. Default `TARGET_DBFS=-20` (a normal, healthy speech level). Change it with `TARGET_DBFS=-26 ./deploy.sh`-style env updates if you want it lower.
+* **Why whole sentences are lost (a second cause, found in several open-source projects, Oct-Nov 2026).** Parakeet TDT decoders sometimes return only blanks for several seconds of clear speech, especially after a pause of 1.5 s or more, in windows of 20-30 s, or when a window starts/ends right on the voice. Reports say Parakeet v3 (the base of Redux) loses speech at every window length tested (5 of 58 windows at 20 s), while v2 lost none up to 30 s. Fixes applied: speech is cut at pauses into pieces of at most 12 s (`PIECE_MAX_S`), long silences are never sent to the model, and a piece whose result looks too short (no words, or under 0.6 words per second in a piece of 4 s or more) is decoded again with 0.5 s of faint noise on both edges; the result with more words wins. `/health` shows `stt_recovered`, how many pieces this saved.
+* **Neural networks added:** Silero VAD (voice detector) now runs for both backends, with threshold 0.4. **Not added, on purpose:** a noise-removal network. A 2026 study found speech enhancement lowers Parakeet and Whisper accuracy in every tested case (the models were trained on noisy audio and do not know enhancement artefacts). A high-pass filter below about 70 Hz is applied; that is not a neural network and is safe.
+* **Accuracy honesty.** For English on a CPU, the old v2 backend (`STT_BACKEND=sherpa`) is more accurate and more robust than Redux (Moondream's own numbers: Redux 6.55% vs 6.26% for v3 on English, 9.04% vs 6.72% in noise; v2 about 6.0% on the Open ASR Leaderboard) but needs about 1.2-1.65 GB of RAM. Redux is chosen here for the 1 GB limit.
+* **Untested options for later.** A third-party package `voxrt` (Rust runtime for Redux, Apache-2.0, Linux x86-64 wheels, no PyTorch) and community ONNX exports of Redux exist; they could use less RAM than Photon, but were not tested here.
 
 ## The audio neural networks: what is used, and what is not (internet check, Nov 2026; written for the sherpa backend)
 

@@ -32,7 +32,18 @@ def download(url: str, dest: str, tries: int = 6):
             time.sleep(3 * i)
 
 
+def fetch_vad():
+    """Silero VAD (about 2 MB) finds the pauses where speech is cut into pieces. Needed by both backends."""
+    dest_dir = os.path.join(OUT, "stt")
+    os.makedirs(dest_dir, exist_ok=True)
+    path = os.path.join(dest_dir, "silero_vad.onnx")
+    download(VAD_URL, path)
+    if os.path.getsize(path) < 100000:
+        sys.exit("silero_vad.onnx looks wrong (too small)")
+
+
 def fetch_redux():
+    fetch_vad()
     try:
         import moondream as md
         for i in range(1, 4):
@@ -65,9 +76,7 @@ def fetch_sherpa():
     missing = [f for f in KEEP if not os.path.exists(os.path.join(dest_dir, f))]
     if missing:
         sys.exit(f"model files missing after download: {missing}")
-    download(VAD_URL, os.path.join(dest_dir, "silero_vad.onnx"))
-    if os.path.getsize(os.path.join(dest_dir, "silero_vad.onnx")) < 100000:
-        sys.exit("silero_vad.onnx looks wrong (too small)")
+    fetch_vad()
     print("Parakeet TDT 0.6B v2 + Silero VAD ready in", dest_dir, sorted(os.listdir(dest_dir)), flush=True)
 
 
