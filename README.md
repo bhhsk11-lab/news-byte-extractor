@@ -5,7 +5,7 @@ Cloud Run service (2 vCPU / 2 GiB). No GPU. Nothing is billed while you are not 
 
 | Job | Model | Why |
 |---|---|---|
-| Speech → text | **faster-whisper `small.en`** (int8) | Runs on CPU, English only |
+| Speech → text | **NVIDIA Parakeet TDT 0.6B v2** (int8) by default. Moonshine and faster-whisper are options | Runs on CPU, English only. See *Speech-to-text engines* below |
 | Text → speech | **Kokoro-82M** (fp32, ONNX) | Natural English voice, runs on CPU |
 
 The extension already speaks the OpenAI speech API, so **no extension changes are needed**. You only paste a URL and a key.
@@ -104,7 +104,11 @@ Change these with `gcloud run services update news-byte-extractor --region asia-
 | `VOICE_HI_FEMALE` / `VOICE_HI_MALE` | `hf_alpha` / `hm_omega` | `hf_beta` / `hm_psi` |
 | `WHISPER_VAD` | `1` | `0` if it cuts off quiet speech |
 
-Changing the **Whisper model** needs a rebuild: edit `ARG WHISPER_MODEL=small.en` in the `Dockerfile`, then run `./deploy.sh` again.
+Changing the **speech-to-text engine** needs a rebuild: edit `ARG STT_ENGINE=parakeet` in the `Dockerfile` (see the engine table below), then deploy again. Do not change `STT_ENGINE` only in the Cloud Run settings: the model files are baked into the image at build time.
+
+The Whisper-only settings below (`WHISPER_BEAM`, `WHISPER_HOTWORDS`, `ALLOWED_LANGS`, `RETRY_LOGPROB`, `DENOISE`, `SNR_CLEAN_DB`, `WHISPER_VAD`) apply only when `STT_ENGINE=whisper`.
+
+For the Whisper engine only:
 * `base.en`: about twice as fast and lighter, a little less accurate.
 * `small.en`: the default.
 * `medium.en`: more accurate, but too slow for live talking on 2 vCPU, and it may not fit in 2 GiB next to the voice model.
@@ -180,3 +184,31 @@ Meaning: Whisper already copes well with steady noise, the gate never made thing
 This version only understands English. Hindi and Hinglish speech will come out as wrongly spelled English words.
 To change speed, run `CPU=4 MEMORY=2Gi ./deploy.sh` (4 vCPU, about twice the price per active hour).
 `/health` shows `"build": "voice-v5-en"` when this version is running.
+
+## Speech-to-text engines (build `voice-v6-fast`)
+
+faster-whisper is already the fast way to run Whisper. The slowness comes from Whisper itself: it always processes a 30-second window, even for a 2-second command, so most of the work is wasted on padding. The other engines have no such window.
+
+I ran every engine on the same test machine (1 CPU thread, int8 ONNX, same runtime), with 10 short spoken commands (about 2.5 s each) and 4 long clips:
+
+| Engine | RAM | Time per short command | Word errors, clean | Word errors, noisy room (8 dB) | Languages |
+|---|---|---|---|---|---|
+| Moonshine tiny | 0.3 GB | 0.09 s | 4.1% | 7.4% | English |
+| Moonshine base | 0.5 GB | 0.19 s | 2.9% | 12.1% | English |
+| **Parakeet 0.6B v2 (default)** | 1.0 GB | 0.46 s | 2.9% | 2.9% | English |
+| Whisper base.en | 0.5 GB | 0.65 s | 4.0% | 6.4% | English |
+| Distil-Whisper small.en | 0.8 GB | 1.05 s | 2.9% | 9.5% | English |
+| Whisper small.en | 1.1 GB | 1.75 s | 2.9% | 4.1% | English |
+
+Read this carefully:
+* The test is small (about 68 words per row, so one word is about 1.5 points) and the speech is computer-generated, which is easier than real voices. Use it for the **ranking**, not for exact numbers.
+* The Whisper rows ran through the ONNX runtime, **not** faster-whisper (the faster-whisper files could not be downloaded in my test environment). faster-whisper is probably faster than shown, so the real gap to Whisper is likely smaller than the table.
+* Moonshine is the fastest and smallest, but in noise it made more mistakes in my test. Parakeet stayed accurate in noise.
+* Parakeet writes numbers as digits ("25 minutes") and adds capital letters and punctuation.
+* The noise gate (`audio_clean.py`) is **not** used for Parakeet and Moonshine. I tested it: it made them slightly worse (for example Parakeet with mains hum went from 0.9% to 4.7% errors). It stays in the Whisper path, where it was neutral or a little helpful.
+* Parakeet and Moonshine are **English only**. For Hindi you need `STT_ENGINE=whisper` with the multilingual `small` model (the earlier `voice-v4` build).
+* Parakeet is licensed CC-BY-4.0 on its model card (attribution required). Moonshine English models are MIT.
+* One artificial test, the same three sentences repeated seven times with no pause, made Parakeet skip some repeats. Normal speech did not (55 s of different sentences: 149 of 150 words right).
+* Recordings are cut at the quietest moment into pieces of at most 20 s, which keeps memory low.
+
+**Memory on Cloud Run (2 GiB):** measured in one process with the voice model loaded: Parakeet 1.2 GB after start-up, about 1.5 to 1.65 GB during a long recording. Moonshine tiny: 0.65 GB after start-up, 1.0 GB peak. Parakeet leaves less spare room than Moonshine, so watch the memory graph. If it stays above about 85%, use `moonshine-base` or raise `--memory` to `3Gi`.

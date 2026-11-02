@@ -36,6 +36,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 # ------------------------------------------------------------------ settings (all overridable with env vars)
 API_KEY = os.getenv("API_KEY", "").strip()                    # clients send  Authorization: Bearer <API_KEY>
+STT_ENGINE = os.getenv("STT_ENGINE", "parakeet").strip().lower()   # parakeet (fast + accurate) | moonshine-base | moonshine-tiny (fastest) | whisper
+STT_DIR = os.getenv("STT_DIR", "/models/stt")                  # used by parakeet / moonshine
 WHISPER_DIR = os.getenv("WHISPER_DIR", "/models/whisper")     # baked into the image (see Dockerfile)
 WHISPER_THREADS = int(os.getenv("WHISPER_THREADS", "2"))      # = number of vCPUs
 WHISPER_BEAM = int(os.getenv("WHISPER_BEAM", "2"))            # 1 = greedy = fastest. 2 = good balance. 3-5 = best, slower
@@ -67,11 +69,32 @@ _stt_lock, _tts_lock = threading.Lock(), threading.Lock()     # one STT and one 
 
 
 # ------------------------------------------------------------------ model loading
+def _load_sherpa():
+    """Parakeet / Moonshine through sherpa-onnx (int8 ONNX, CPU)."""
+    import sherpa_onnx as so
+    d = STT_DIR
+    if STT_ENGINE == "parakeet":
+        return so.OfflineRecognizer.from_transducer(
+            encoder=f"{d}/encoder.int8.onnx", decoder=f"{d}/decoder.int8.onnx", joiner=f"{d}/joiner.int8.onnx",
+            tokens=f"{d}/tokens.txt", num_threads=WHISPER_THREADS, sample_rate=16000, feature_dim=80,
+            decoding_method="greedy_search", model_type="nemo_transducer", provider="cpu")
+    if STT_ENGINE.startswith("moonshine"):
+        return so.OfflineRecognizer.from_moonshine(
+            preprocessor=f"{d}/preprocess.onnx", encoder=f"{d}/encode.int8.onnx",
+            uncached_decoder=f"{d}/uncached_decode.int8.onnx", cached_decoder=f"{d}/cached_decode.int8.onnx",
+            tokens=f"{d}/tokens.txt", num_threads=WHISPER_THREADS, provider="cpu")
+    raise RuntimeError(f"unknown STT_ENGINE '{STT_ENGINE}' (use parakeet, moonshine-base, moonshine-tiny or whisper)")
+
+
 def load_models():
-    from faster_whisper import WhisperModel
     t = time.time()
-    _stt["model"] = WhisperModel(WHISPER_DIR, device="cpu", compute_type="int8", cpu_threads=WHISPER_THREADS, num_workers=1)
-    log.info("whisper loaded in %.1fs (%s)", time.time() - t, WHISPER_DIR)
+    if STT_ENGINE == "whisper":
+        from faster_whisper import WhisperModel
+        _stt["model"] = WhisperModel(WHISPER_DIR, device="cpu", compute_type="int8", cpu_threads=WHISPER_THREADS, num_workers=1)
+        log.info("whisper loaded in %.1fs (%s)", time.time() - t, WHISPER_DIR)
+    else:
+        _stt["model"] = _load_sherpa()
+        log.info("%s loaded in %.1fs (%s)", STT_ENGINE, time.time() - t, STT_DIR)
 
     import onnxruntime as ort
     from kokoro_onnx import Kokoro
@@ -91,7 +114,10 @@ def warm_up():
         rng = np.random.default_rng(0)
         probe = (0.05 * rng.standard_normal(16000 * 2)).astype(np.float32)   # not silence, so the encoder really runs
         with _stt_lock:
-            list(_stt["model"].transcribe(probe, language="en", beam_size=WHISPER_BEAM, without_timestamps=True)[0])
+            if STT_ENGINE == "whisper":
+                list(_stt["model"].transcribe(probe, language="en", beam_size=WHISPER_BEAM, without_timestamps=True)[0])
+            else:
+                _sherpa_decode(probe)
         ac.clean(probe)                                                       # warms numpy FFT paths too
         _synthesize_blocking("Hello.", EN_FEMALE, 1.0)
         log.info("warm-up done")
@@ -244,6 +270,58 @@ def _is_hallucination(seg) -> bool:
     return weak and t in _HALLUCINATIONS
 
 
+def _sherpa_decode(audio: np.ndarray) -> str:
+    rec = _stt["model"]
+    stream = rec.create_stream()
+    stream.accept_waveform(16000, audio)
+    rec.decode_stream(stream)
+    return stream.result.text.strip()
+
+
+def _speech_only(audio: np.ndarray):
+    """Silero voice detection (already installed with faster-whisper): trims the silence around the speech and returns
+    None when the recording holds no speech at all, so noise alone never turns into invented words."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+    spans = get_speech_timestamps(audio, VadOptions(threshold=0.45, min_silence_duration_ms=350,
+                                                    speech_pad_ms=250, min_speech_duration_ms=120))
+    if not spans:
+        return None
+    return audio[max(0, spans[0]["start"] - 4000): spans[-1]["end"] + 4000]
+
+
+def _split_long(audio: np.ndarray, max_s: float = 20.0):
+    """Cut long recordings into pieces of at most ~20 s, always at the quietest moment (never mid-word)."""
+    n, k = int(max_s * 16000), 1600
+    out, start = [], 0
+    while len(audio) - start > n:
+        lo, hi = start + int(n * 0.7), start + n
+        level = np.convolve(np.abs(audio[lo:hi]), np.ones(k) / k, mode="valid")
+        cut = lo + int(np.argmin(level)) + k // 2
+        out.append(audio[start:cut])
+        start = cut
+    out.append(audio[start:])
+    return out
+
+
+def _transcribe_sherpa(data: bytes):
+    t0 = time.time()
+    audio = _prepare(_decode(data))
+    if audio.size < 1600:
+        log.info("STT skipped: no speech in recording")
+        return ""
+    # No noise gate here on purpose: in our tests it made Parakeet and Moonshine slightly WORSE, not better.
+    audio = _speech_only(audio)
+    if audio is None:
+        log.info("STT skipped: only noise, no speech")
+        return ""
+    with _stt_lock:
+        text = " ".join(_sherpa_decode(piece) for piece in _split_long(audio))
+    text = re.sub(r"\s+", " ", text).strip()
+    dt = time.time() - t0
+    log.info("STT[%s] %.1fs audio in %.2fs (x%.1f): %s", STT_ENGINE, len(audio) / 16000, dt, len(audio) / 16000 / max(dt, 1e-3), text[:80])
+    return text
+
+
 def _run_whisper(audio: np.ndarray, lang, prompt: str):
     """One Whisper pass. Returns (text, confidence, info). Confidence = average token log-probability (closer to 0 = surer)."""
     segs, info = _stt["model"].transcribe(
@@ -292,6 +370,8 @@ def _audio_versions(audio: np.ndarray):
 
 
 def _transcribe_blocking(data: bytes, language: str, prompt: str):
+    if STT_ENGINE != "whisper":
+        return _transcribe_sherpa(data)           # Parakeet / Moonshine: English only, no language or prompt needed
     t0 = time.time()
     audio = _prepare(_decode(data))
     if audio.size < 1600:                              # < 0.1 s or silence: nothing to transcribe
@@ -502,5 +582,5 @@ async def voices(_: None = Depends(auth)):
 @app.get("/health")
 async def health():
     return {"ok": _ready.is_set(), "loading": not _ready.is_set() and not _boot["error"], "error": _boot["error"],
-            "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": os.path.basename(WHISPER_DIR.rstrip("/")),
-            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v5-en", "beam": WHISPER_BEAM, "langs": ALLOWED_LANGS}
+            "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": (os.path.basename(WHISPER_DIR.rstrip("/")) if STT_ENGINE == "whisper" else STT_ENGINE),
+            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v6-fast", "engine": STT_ENGINE, "beam": WHISPER_BEAM, "langs": ALLOWED_LANGS}
