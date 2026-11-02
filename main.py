@@ -1,8 +1,8 @@
 """
 CPU voice server for Cloud Run  -  OpenAI-compatible speech API.
 
-    POST /v1/audio/transcriptions   speech -> text   (faster-whisper, int8, CPU)
-    POST /v1/audio/speech           text -> speech   (Kokoro-82M ONNX, CPU, English + Hindi)
+    POST /v1/audio/transcriptions   speech -> text   (faster-whisper, int8, CPU, English)
+    POST /v1/audio/speech           text -> speech   (Kokoro-82M ONNX, CPU)
     GET  /health                    warm-up / status
 
 The AI Chat Firefox extension already speaks this API: in Settings > Voice set the
@@ -13,12 +13,13 @@ import hmac
 import io
 import logging
 import os
+import queue
 import re
 import threading
 import time
 import wave
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 import lameenc
 import numpy as np
@@ -36,23 +37,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 # ------------------------------------------------------------------ settings (all overridable with env vars)
 API_KEY = os.getenv("API_KEY", "").strip()                    # clients send  Authorization: Bearer <API_KEY>
-STT_ENGINE = os.getenv("STT_ENGINE", "parakeet").strip().lower()   # parakeet (fast + accurate) | moonshine-base | moonshine-tiny (fastest) | whisper
-STT_DIR = os.getenv("STT_DIR", "/models/stt")                  # used by parakeet / moonshine
-WHISPER_DIR = os.getenv("WHISPER_DIR", "/models/whisper")     # baked into the image (see Dockerfile)
-WHISPER_THREADS = int(os.getenv("WHISPER_THREADS", "2"))      # = number of vCPUs
-WHISPER_BEAM = int(os.getenv("WHISPER_BEAM", "2"))            # 1 = greedy = fastest. 2 = good balance. 3-5 = best, slower
-WHISPER_VAD = os.getenv("WHISPER_VAD", "1") == "1"            # drop silence: fewer "Thank you." hallucinations
-ALLOWED_LANGS = [x.strip() for x in re.split(r"[,;| ]+", os.getenv("ALLOWED_LANGS", "en")) if x.strip()]  # auto-detect picks ONLY from these
-WHISPER_HOTWORDS = " ".join(re.split(r"[,;|]+", os.getenv("WHISPER_HOTWORDS", ""))).strip()  # optional: names / terms you say often, separated by spaces
-DENOISE = os.getenv("DENOISE", "auto").strip().lower()        # auto = clean only when the room is noisy, with a safety re-check | on | off
+STT_ENGINE = "faster-whisper"                                  # the ONLY speech-to-text engine (English)
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small.en")         # only used in logs / health: the model itself is baked into the image (see Dockerfile)
+WHISPER_DIR = os.getenv("WHISPER_DIR", "/models/whisper")
+WHISPER_THREADS = int(os.getenv("WHISPER_THREADS", "2"))       # = number of vCPUs, shared by all workers
+STT_WORKERS = max(1, int(os.getenv("STT_WORKERS", str(max(1, min(2, WHISPER_THREADS))))))  # recordings transcribed AT THE SAME TIME (one shared model, extra memory only for working space)
+WHISPER_BEAM = int(os.getenv("WHISPER_BEAM", "2"))             # 1 = greedy = fastest. 2 = good balance. 3-5 = best, slower
+WHISPER_VAD = os.getenv("WHISPER_VAD", "1") == "1"             # drop silence: fewer "Thank you." hallucinations
+WHISPER_HOTWORDS = " ".join(re.split(r"[,;|]+", os.getenv("WHISPER_HOTWORDS", ""))).strip()  # optional: names / terms you say often
+DENOISE = os.getenv("DENOISE", "auto").strip().lower()         # auto = clean only when the room is noisy, with a safety re-check | on | off
 SNR_CLEAN_DB = float(os.getenv("SNR_CLEAN_DB", "18"))          # recordings at or above this speech-to-noise ratio are never gated
 RETRY_LOGPROB = float(os.getenv("RETRY_LOGPROB", "-0.50"))     # below this confidence, the other audio version is tried too
+STT_QUEUE_MAX = int(os.getenv("STT_QUEUE_MAX", "8"))           # more than this many recordings waiting -> HTTP 429 (client retries) instead of a long hang
+TTS_WORKERS = max(1, int(os.getenv("TTS_WORKERS", "1")))       # sentences spoken at the same time (each copy of Kokoro needs ~0.55 GB RAM)
 MAX_AUDIO_SECONDS = float(os.getenv("MAX_AUDIO_SECONDS", "120"))  # protects the 2 GiB memory limit
 TRIM_TTS = os.getenv("TRIM_TTS", "1") == "1"                  # cut dead air at the start/end of speech -> denser, snappier audio
 TTS_CACHE_MAX = int(os.getenv("TTS_CACHE_MAX", "64"))         # repeated sentences are served instantly
 KOKORO_MODEL = os.getenv("KOKORO_MODEL", "/models/kokoro.onnx")     # fp32 build. Do NOT use the int8 file: it outputs garbage
 KOKORO_VOICES = os.getenv("KOKORO_VOICES", "/models/voices.bin")
-KOKORO_THREADS = int(os.getenv("KOKORO_THREADS", "2"))
+KOKORO_THREADS = int(os.getenv("KOKORO_THREADS", "2"))         # threads per Kokoro copy
 MP3_KBPS = int(os.getenv("MP3_KBPS", "48"))                   # small = cheap egress. 64 for a bit more quality
 MAX_AUDIO_MB = float(os.getenv("MAX_AUDIO_MB", "25"))
 
@@ -62,50 +65,82 @@ EN_FEMALE, EN_MALE = os.getenv("VOICE_EN_FEMALE", "af_heart"), os.getenv("VOICE_
 HI_FEMALE, HI_MALE = os.getenv("VOICE_HI_FEMALE", "hf_alpha"), os.getenv("VOICE_HI_MALE", "hm_omega")
 MALE_NAMES = {"cedar", "ash", "echo", "ballad", "verse", "onyx", "fable"}
 
-_stt = {"model": None}
-_tts = {"model": None, "voices": set()}
+class Busy(Exception):
+    pass
+
+
+class Pool:
+    """A few ready-to-use model copies. A request takes one, uses it alone, gives it back. When all copies are busy the
+    request waits in line (up to `max_wait` others); this is what lets several people be served at the same moment."""
+
+    def __init__(self, items, max_wait: int = 1000):
+        self._q: "queue.Queue" = queue.Queue()
+        for it in items:
+            self._q.put(it)
+        self.size = len(items)
+        self.max_wait, self.waiting, self.active = max_wait, 0, 0
+        self._n = threading.Lock()
+
+    @contextmanager
+    def take(self):
+        with self._n:
+            if self._q.empty() and self.waiting >= self.max_wait:
+                raise Busy()
+            self.waiting += 1
+        try:
+            item = self._q.get()
+        finally:
+            with self._n:
+                self.waiting -= 1
+        with self._n:
+            self.active += 1
+        try:
+            yield item
+        finally:
+            with self._n:
+                self.active -= 1
+            self._q.put(item)
+
+
+_stt = {"model": None, "pool": None}
+_tts = {"pool": None, "voices": set()}
 _tts_cache: "OrderedDict" = OrderedDict()
-_stt_lock, _tts_lock = threading.Lock(), threading.Lock()     # one STT and one TTS job at a time -> predictable speed
 
 
 # ------------------------------------------------------------------ model loading
-def _load_sherpa():
-    """Parakeet / Moonshine through sherpa-onnx (int8 ONNX, CPU)."""
-    import sherpa_onnx as so
-    d = STT_DIR
-    if STT_ENGINE == "parakeet":
-        return so.OfflineRecognizer.from_transducer(
-            encoder=f"{d}/encoder.int8.onnx", decoder=f"{d}/decoder.int8.onnx", joiner=f"{d}/joiner.int8.onnx",
-            tokens=f"{d}/tokens.txt", num_threads=WHISPER_THREADS, sample_rate=16000, feature_dim=80,
-            decoding_method="greedy_search", model_type="nemo_transducer", provider="cpu")
-    if STT_ENGINE.startswith("moonshine"):
-        return so.OfflineRecognizer.from_moonshine(
-            preprocessor=f"{d}/preprocess.onnx", encoder=f"{d}/encode.int8.onnx",
-            uncached_decoder=f"{d}/uncached_decode.int8.onnx", cached_decoder=f"{d}/cached_decode.int8.onnx",
-            tokens=f"{d}/tokens.txt", num_threads=WHISPER_THREADS, provider="cpu")
-    raise RuntimeError(f"unknown STT_ENGINE '{STT_ENGINE}' (use parakeet, moonshine-base, moonshine-tiny or whisper)")
+def _log_memory(where: str):
+    """Resident memory of this process, so you can read the real GB per model copy in the Cloud Run logs."""
+    try:
+        with open("/proc/self/status") as f:
+            kb = next(int(l.split()[1]) for l in f if l.startswith("VmRSS:"))
+        log.info("MEMORY %s: %.2f GB resident", where, kb / 1048576)
+    except Exception:
+        pass
 
 
 def load_models():
     t = time.time()
-    if STT_ENGINE == "whisper":
-        from faster_whisper import WhisperModel
-        _stt["model"] = WhisperModel(WHISPER_DIR, device="cpu", compute_type="int8", cpu_threads=WHISPER_THREADS, num_workers=1)
-        log.info("whisper loaded in %.1fs (%s)", time.time() - t, WHISPER_DIR)
-    else:
-        _stt["model"] = _load_sherpa()
-        log.info("%s loaded in %.1fs (%s)", STT_ENGINE, time.time() - t, STT_DIR)
+    from faster_whisper import WhisperModel
+    per = max(1, WHISPER_THREADS // STT_WORKERS)               # CPU threads for each running recording
+    _stt["model"] = WhisperModel(WHISPER_DIR, device="cpu", compute_type="int8", cpu_threads=per, num_workers=STT_WORKERS)
+    _stt["pool"] = Pool([True] * STT_WORKERS, max_wait=STT_QUEUE_MAX)   # tokens: at most STT_WORKERS recordings run at once, the rest wait in line
+    log.info("whisper %s x%d workers (%d thread(s) each) loaded in %.1fs (%s)", WHISPER_MODEL, STT_WORKERS, per, time.time() - t, WHISPER_DIR)
+    _log_memory("after STT load")
 
     import onnxruntime as ort
     from kokoro_onnx import Kokoro
     t = time.time()
-    so = ort.SessionOptions()
-    so.intra_op_num_threads = KOKORO_THREADS
-    so.inter_op_num_threads = 1
-    sess = ort.InferenceSession(KOKORO_MODEL, sess_options=so, providers=["CPUExecutionProvider"])
-    _tts["model"] = Kokoro.from_session(sess, KOKORO_VOICES)
-    _tts["voices"] = set(_tts["model"].get_voices())
-    log.info("kokoro loaded in %.1fs (%d voices)", time.time() - t, len(_tts["voices"]))
+    copies = []
+    for _ in range(TTS_WORKERS):
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = KOKORO_THREADS
+        so.inter_op_num_threads = 1
+        sess = ort.InferenceSession(KOKORO_MODEL, sess_options=so, providers=["CPUExecutionProvider"])
+        copies.append(Kokoro.from_session(sess, KOKORO_VOICES))
+    _tts["pool"] = Pool(copies)
+    _tts["voices"] = set(copies[0].get_voices())
+    log.info("kokoro x%d loaded in %.1fs (%d voices)", TTS_WORKERS, time.time() - t, len(_tts["voices"]))
+    _log_memory("after TTS load")
 
 
 def warm_up():
@@ -113,13 +148,14 @@ def warm_up():
     try:
         rng = np.random.default_rng(0)
         probe = (0.05 * rng.standard_normal(16000 * 2)).astype(np.float32)   # not silence, so the encoder really runs
-        with _stt_lock:
-            if STT_ENGINE == "whisper":
-                list(_stt["model"].transcribe(probe, language="en", beam_size=WHISPER_BEAM, without_timestamps=True)[0])
-            else:
-                _sherpa_decode(probe)
+        def _one():
+            list(_stt["model"].transcribe(probe, language="en", beam_size=WHISPER_BEAM, without_timestamps=True)[0])
+        ths = [threading.Thread(target=_one) for _ in range(STT_WORKERS)]   # every worker gets warmed
+        [t.start() for t in ths]
+        [t.join() for t in ths]
         ac.clean(probe)                                                       # warms numpy FFT paths too
         _synthesize_blocking("Hello.", EN_FEMALE, 1.0)
+        _log_memory("after warm-up")
         log.info("warm-up done")
     except Exception as e:  # never block startup because of the warm-up
         log.warning("warm-up skipped: %s", e)
@@ -144,7 +180,7 @@ def _boot_models():
 async def lifespan(app):
     # PRELOAD=1 (default): load the models BEFORE the port opens. Cloud Run gives a starting container full CPU, but once the startup
     # check has passed it slows an idle container to almost nothing, so a background load stalled for 6-14 minutes (seen in the logs:
-    # "parakeet loaded in 374.1s", "READY after 830.4s") and the first recordings waited 16 s for it. Loading first takes ~20-40 s at full CPU.
+    # "whisper loaded in 374.1s", "READY after 830.4s") and the first recordings waited 16 s for it. Loading first takes ~20-40 s at full CPU.
     # PRELOAD=0: the old behaviour (open at once, load in the background; requests wait up to 90 s).
     if os.getenv("PRELOAD", "1") == "1":
         await run_in_threadpool(_boot_models)
@@ -218,20 +254,8 @@ def _decode(data: bytes) -> np.ndarray:
     return np.concatenate(chunks).astype(np.float32) / 32768.0
 
 
-def _lang_code(language: str):
-    """'en-IN' -> 'en', 'hi-IN' -> 'hi', 'hinglish' -> 'hi', '' / 'auto' / unknown -> None (we detect it ourselves)."""
-    if ALLOWED_LANGS == ["en"]:                         # English-only mode: never detect, never guess
-        return "en"
-    code = (language or "").strip().lower().replace("_", "-").split("-")[0]
-    if code == "hinglish":
-        return "hi"
-    if code in ("auto", ""):
-        return None
-    return code if code in _stt["model"].supported_languages else None
-
-
 def _prepare(audio: np.ndarray) -> np.ndarray:
-    """Clean the recording before Whisper sees it: remove DC offset and lift quiet microphones to a healthy level.
+    """Clean the recording before Whisper hears it: remove DC offset and lift quiet microphones to a healthy level.
     Quiet / low-gain audio is a top cause of wrong words. Returns an empty array when there is no real sound."""
     if audio.size == 0:
         return audio
@@ -245,27 +269,10 @@ def _prepare(audio: np.ndarray) -> np.ndarray:
     return np.clip(audio, -1.0, 1.0).astype(np.float32)
 
 
-def _detect_language(audio: np.ndarray):
-    """Whisper's own language guess is often wrong for Indian speech (Hindi heard as Urdu, English heard as Welsh...).
-    We look at its full probability table but only accept a language from ALLOWED_LANGS (default en, hi)."""
-    try:
-        _, _, probs = _stt["model"].detect_language(audio, vad_filter=WHISPER_VAD, language_detection_segments=2)
-        table = dict(probs)
-        pool = {k: table.get(k, 0.0) for k in ALLOWED_LANGS}
-        if pool:
-            best = max(pool, key=pool.get)
-            log.info("lang detect: %s", ", ".join(f"{k}={v:.2f}" for k, v in sorted(pool.items(), key=lambda kv: -kv[1])))
-            return best
-    except Exception as e:
-        log.warning("language detection skipped: %s", e)
-    return None
-
-
 # Phrases Whisper invents out of silence / noise. Dropped only when the segment is also low-confidence.
 _HALLUCINATIONS = {
     "thank you", "thanks", "thank you.", "thanks for watching", "thank you for watching", "bye", "bye.", "you",
     "subtitles by the amara.org community", "please subscribe", "like and subscribe",
-    "धन्यवाद", "शुक्रिया", "थैंक यू", "देखने के लिए धन्यवाद", "सब्सक्राइब करें",
 }
 
 
@@ -275,67 +282,11 @@ def _is_hallucination(seg) -> bool:
     return weak and t in _HALLUCINATIONS
 
 
-def _sherpa_decode(audio: np.ndarray) -> str:
-    rec = _stt["model"]
-    stream = rec.create_stream()
-    stream.accept_waveform(16000, audio)
-    rec.decode_stream(stream)
-    return stream.result.text.strip()
-
-
-def _speech_only(audio: np.ndarray):
-    """Silero voice detection (already installed with faster-whisper): trims the silence around the speech and returns
-    None when the recording holds no speech at all, so noise alone never turns into invented words."""
-    from faster_whisper.vad import VadOptions, get_speech_timestamps
-    spans = get_speech_timestamps(audio, VadOptions(threshold=0.45, min_silence_duration_ms=350,
-                                                    speech_pad_ms=250, min_speech_duration_ms=120))
-    if not spans:
-        return None
-    return audio[max(0, spans[0]["start"] - 4000): spans[-1]["end"] + 4000]
-
-
-def _split_long(audio: np.ndarray, max_s: float = 20.0):
-    """Cut long recordings into pieces of at most ~20 s, always at the quietest moment (never mid-word)."""
-    n, k = int(max_s * 16000), 1600
-    out, start = [], 0
-    while len(audio) - start > n:
-        lo, hi = start + int(n * 0.7), start + n
-        level = np.convolve(np.abs(audio[lo:hi]), np.ones(k) / k, mode="valid")
-        cut = lo + int(np.argmin(level)) + k // 2
-        out.append(audio[start:cut])
-        start = cut
-    out.append(audio[start:])
-    return out
-
-
-def _transcribe_sherpa(data: bytes):
-    t0 = time.time()
-    raw = _decode(data)
-    qual = ac.describe(ac.stats(raw))                  # what the browser really sent (before our own level boost)
-    audio = _prepare(raw)
-    if audio.size < 1600:
-        log.info("STT skipped: no speech in recording")
-        return ""
-    # No noise gate here on purpose: in our tests it made Parakeet and Moonshine slightly WORSE, not better.
-    audio = _speech_only(audio)
-    if audio is None:
-        log.info("STT skipped: only noise, no speech")
-        return ""
-    with _stt_lock:
-        text = " ".join(_sherpa_decode(piece) for piece in _split_long(audio))
-    text = re.sub(r"\s+", " ", text).strip()
-    dt = time.time() - t0
-    log.info("STT[%s] %.1fs audio in %.2fs (x%.1f) %s: %s", STT_ENGINE, len(audio) / 16000, dt, len(audio) / 16000 / max(dt, 1e-3), qual, text[:80])
-    if not text:
-        log.warning("STT[%s] heard NOTHING in %.1fs of audio (%s). Not English, too distorted, or only background / the assistant's own echo.", STT_ENGINE, len(audio) / 16000, qual)
-    return text
-
-
-def _run_whisper(audio: np.ndarray, lang, prompt: str):
+def _run_whisper(audio: np.ndarray, prompt: str):
     """One Whisper pass. Returns (text, confidence, info). Confidence = average token log-probability (closer to 0 = surer)."""
     segs, info = _stt["model"].transcribe(
         audio,
-        language=lang,
+        language="en",
         task="transcribe",
         beam_size=WHISPER_BEAM, best_of=3,            # best_of only matters in the temperature fallback below
         temperature=(0.0, 0.2, 0.4),                  # retry a failed / garbled window at a higher temperature
@@ -378,32 +329,31 @@ def _audio_versions(audio: np.ndarray):
     return snr, ([("plain", plain), ("gated", gated)] if snr >= SNR_CLEAN_DB else [("gated", gated), ("plain", plain)])
 
 
-def _transcribe_blocking(data: bytes, language: str, prompt: str):
-    if STT_ENGINE != "whisper":
-        return _transcribe_sherpa(data)           # Parakeet / Moonshine: English only, no language or prompt needed
+def _transcribe_blocking(data: bytes, prompt: str = ""):
     t0 = time.time()
-    audio = _prepare(_decode(data))
+    raw = _decode(data)
+    qual = ac.describe(ac.stats(raw))                  # what the browser really sent (before our own level boost)
+    audio = _prepare(raw)
     if audio.size < 1600:                              # < 0.1 s or silence: nothing to transcribe
         log.info("STT skipped: no speech in recording")
         return ""
-    lang = _lang_code(language)
-    with _stt_lock:
-        if lang is None:
-            lang = _detect_language(audio)
+    with _stt["pool"].take():                          # waits here when all workers are busy
         snr, versions = _audio_versions(audio)
         name, ver = versions[0]
-        text, conf, info = _run_whisper(ver, lang, prompt)
+        text, conf, info = _run_whisper(ver, prompt)
         used = name
         # Not sure about the result (or nothing heard)? Listen once more to the other version of the same recording and
         # keep whichever Whisper is more confident about. Costs time only on hard recordings; clear speech never pays it.
         if len(versions) > 1 and (conf < RETRY_LOGPROB or not text) and audio.size < 20 * 16000:
             name2, ver2 = versions[1]
-            text2, conf2, _ = _run_whisper(ver2, lang, prompt)
+            text2, conf2, _ = _run_whisper(ver2, prompt)
             if text2 and (not text or conf2 > conf + 0.05):
                 text, conf, used = text2, conf2, name2
     dt = time.time() - t0
-    log.info("STT %.1fs audio in %.2fs (x%.1f) lang=%s %s used=%s conf=%.2f: %s",
-             info.duration, dt, info.duration / max(dt, 1e-3), lang or info.language, ac.describe(ac.stats(audio)), used, conf, text[:80])
+    log.info("STT[%s %s] %.1fs audio in %.2fs (x%.1f) %s used=%s conf=%.2f: %s", STT_ENGINE, WHISPER_MODEL, info.duration, dt,
+             info.duration / max(dt, 1e-3), qual, used, conf, text[:80])
+    if not text:
+        log.warning("STT heard NOTHING in %.1fs of audio (%s). Not English, too distorted, or only background / the assistant's own echo.", info.duration, qual)
     return text
 
 
@@ -411,9 +361,9 @@ def _transcribe_blocking(data: bytes, language: str, prompt: str):
 @app.post("/audio/transcriptions")
 async def transcriptions(
     file: UploadFile = File(...),
-    model: str = Form(""),                  # ignored: the model baked into the image is always used
-    language: str = Form(""),
-    prompt: str = Form(""),
+    model: str = Form(""),                  # ignored: the Whisper model baked into the image is always used
+    language: str = Form(""),             # ignored: English only
+    prompt: str = Form(""),               # optional: spelling hints (names, terms) for Whisper
     temperature: float = Form(0.0),
     response_format: str = Form("json"),
     _: None = Depends(auth),
@@ -425,7 +375,9 @@ async def transcriptions(
     if len(data) > MAX_AUDIO_MB * 1024 * 1024:
         raise HTTPException(413, f"Audio larger than {MAX_AUDIO_MB:g} MB.")
     try:
-        text = await run_in_threadpool(_transcribe_blocking, data, language, prompt)
+        text = await run_in_threadpool(_transcribe_blocking, data, prompt)
+    except Busy:
+        raise HTTPException(429, "Too many recordings waiting. Try again in a moment.")
     except HTTPException:
         raise
     except Exception as e:
@@ -499,12 +451,12 @@ def _pick_voice(requested: str, text: str) -> str:
 def _synthesize_blocking(text: str, voice: str, speed: float):
     t0 = time.time()
     parts, sr = [], 24000
-    with _tts_lock:
+    with _tts["pool"].take() as kokoro:
         for chunk, hi in _script_runs(text):
             if not re.search(r"\w", chunk):
                 continue
             try:
-                audio, sr = _tts["model"].create(chunk.strip(), voice=voice, speed=speed, lang="hi" if hi else "en-us")
+                audio, sr = kokoro.create(chunk.strip(), voice=voice, speed=speed, lang="hi" if hi else "en-us")
             except Exception as e:           # one unreadable word must not kill the whole sentence
                 log.warning("skipped chunk %r: %s", chunk[:30], e)
                 continue
@@ -591,5 +543,7 @@ async def voices(_: None = Depends(auth)):
 @app.get("/health")
 async def health():
     return {"ok": _ready.is_set(), "loading": not _ready.is_set() and not _boot["error"], "error": _boot["error"],
-            "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": (os.path.basename(WHISPER_DIR.rstrip("/")) if STT_ENGINE == "whisper" else STT_ENGINE),
-            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v6-fast-preload", "engine": STT_ENGINE, "beam": WHISPER_BEAM, "langs": ALLOWED_LANGS}
+            "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": STT_ENGINE + ":" + WHISPER_MODEL,
+            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v10-faster-whisper", "engine": STT_ENGINE, "lang": "en",
+            "stt_workers": STT_WORKERS, "stt_busy": _stt["pool"].active if _stt["pool"] else 0, "stt_waiting": _stt["pool"].waiting if _stt["pool"] else 0,
+            "tts_workers": TTS_WORKERS}

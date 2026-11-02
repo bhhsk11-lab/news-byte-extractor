@@ -1,4 +1,4 @@
-# CPU voice server (fast speech-to-text + Kokoro TTS) for Cloud Run.
+# CPU voice server (faster-whisper speech-to-text + Kokoro TTS) for Cloud Run.
 # Models are downloaded at BUILD time and baked into the image, so a cold start only loads files from disk.
 FROM python:3.12-slim
 
@@ -11,15 +11,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-# ---- speech-to-text engine (English) ----------------------------------------------------
-# parakeet       = NVIDIA Parakeet TDT 0.6B v2. Fast and very accurate, ~1 GB RAM       <- default
-# moonshine-base = ~2x faster than parakeet, a bit less accurate in noise, ~0.5 GB RAM
-# moonshine-tiny = fastest and smallest (~0.3 GB RAM), least accurate
-# whisper        = the old engine (faster-whisper small.en). Slowest of the four.
-# Change it with:  --build-arg STT_ENGINE=moonshine-base
-ARG STT_ENGINE=parakeet
+# ---- speech-to-text: faster-whisper (CPU, int8) - the only STT engine in this image ----
+# small.en = default: good accuracy, about 1 GB RAM.   base.en = about twice as fast, a little less accurate.
+# medium.en = more accurate but too slow for live talking on 2 vCPU.   Change it with:  --build-arg WHISPER_MODEL=base.en
 ARG WHISPER_MODEL=small.en
-ENV STT_ENGINE=${STT_ENGINE}
+ENV WHISPER_MODEL=${WHISPER_MODEL}
 COPY fetch_stt.py .
 RUN python fetch_stt.py
 
