@@ -142,9 +142,14 @@ def _boot_models():
 
 @asynccontextmanager
 async def lifespan(app):
-    # Start listening at once (Cloud Run's startup check passes), load the models in the background.
-    # Requests that arrive while loading wait up to 90 s; a loading failure is written to the logs and shown on /health.
-    threading.Thread(target=_boot_models, daemon=True).start()
+    # PRELOAD=1 (default): load the models BEFORE the port opens. Cloud Run gives a starting container full CPU, but once the startup
+    # check has passed it slows an idle container to almost nothing, so a background load stalled for 6-14 minutes (seen in the logs:
+    # "parakeet loaded in 374.1s", "READY after 830.4s") and the first recordings waited 16 s for it. Loading first takes ~20-40 s at full CPU.
+    # PRELOAD=0: the old behaviour (open at once, load in the background; requests wait up to 90 s).
+    if os.getenv("PRELOAD", "1") == "1":
+        await run_in_threadpool(_boot_models)
+    else:
+        threading.Thread(target=_boot_models, daemon=True).start()
     yield
 
 
@@ -587,4 +592,4 @@ async def voices(_: None = Depends(auth)):
 async def health():
     return {"ok": _ready.is_set(), "loading": not _ready.is_set() and not _boot["error"], "error": _boot["error"],
             "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": (os.path.basename(WHISPER_DIR.rstrip("/")) if STT_ENGINE == "whisper" else STT_ENGINE),
-            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v6-fast-stats", "engine": STT_ENGINE, "beam": WHISPER_BEAM, "langs": ALLOWED_LANGS}
+            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v6-fast-preload", "engine": STT_ENGINE, "beam": WHISPER_BEAM, "langs": ALLOWED_LANGS}

@@ -212,3 +212,10 @@ Read this carefully:
 * Recordings are cut at the quietest moment into pieces of at most 20 s, which keeps memory low.
 
 **Memory on Cloud Run (2 GiB):** measured in one process with the voice model loaded: Parakeet 1.2 GB after start-up, about 1.5 to 1.65 GB during a long recording. Moonshine tiny: 0.65 GB after start-up, 1.0 GB peak. Parakeet leaves less spare room than Moonshine, so watch the memory graph. If it stays above about 85%, use `moonshine-base` or raise `--memory` to `3Gi`.
+
+---
+
+## v6 preload + audio stats
+
+* **Models load before the port opens** (`PRELOAD=1`, default). On Cloud Run an idle container's CPU is slowed to almost nothing once the startup check has passed, so loading in the background took 6-14 minutes and the first recording waited ~16 s. Now the revision becomes ready only when the models are loaded (about 20-40 s of full CPU). Set `PRELOAD=0` to get the old behaviour back.
+* **Every transcription line shows how the audio looked** when it reached the server: `peak=... voice=... snr=... clip=...%` with a plain warning when it is too quiet, clipped (microphone too loud) or noisy. Clipped audio (more than ~0.5 % of samples at the limit) turns words into other words; lower the microphone input volume in the computer's sound settings.
