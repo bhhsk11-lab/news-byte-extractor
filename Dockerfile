@@ -1,8 +1,11 @@
-# CPU voice server (faster-whisper speech-to-text + Kokoro TTS) for Cloud Run.
+# CPU voice server (Moondream Parakeet Redux speech-to-text + Kokoro TTS) for Cloud Run.
 # Models are downloaded at BUILD time and baked into the image, so a cold start only loads files from disk.
 FROM python:3.12-slim
 
-ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 HF_HUB_DISABLE_TELEMETRY=1
+# STT_BACKEND: redux = Moondream Parakeet Redux (default, small RAM) | sherpa = Parakeet TDT 0.6B v2 int8 (English only, ~1.2-1.65 GB RAM).
+# Change the default here to switch; the same value is used at build time (what to download) and at run time (what to load).
+ARG STT_BACKEND=redux
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 HF_HUB_DISABLE_TELEMETRY=1 STT_BACKEND=${STT_BACKEND} HF_HOME=/models/hf
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -11,11 +14,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-# ---- speech-to-text: faster-whisper (CPU, int8) - the only STT engine in this image ----
-# small.en = default: good accuracy, about 1 GB RAM.   base.en = about twice as fast, a little less accurate.
-# medium.en = more accurate but too slow for live talking on 2 vCPU.   Change it with:  --build-arg WHISPER_MODEL=base.en
-ARG WHISPER_MODEL=small.en
-ENV WHISPER_MODEL=${WHISPER_MODEL}
+# ---- speech-to-text: Moondream Parakeet Redux (25 languages, language picked automatically, CPU) - the only STT model in this image ----
+# Weights are cached at BUILD time. License: CC-BY-4.0, same as NVIDIA's Parakeet (attribution required, see README).
 COPY fetch_stt.py .
 RUN python fetch_stt.py
 

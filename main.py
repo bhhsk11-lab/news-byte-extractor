@@ -1,7 +1,7 @@
 """
 CPU voice server for Cloud Run  -  OpenAI-compatible speech API.
 
-    POST /v1/audio/transcriptions   speech -> text   (faster-whisper, int8, CPU, English)
+    POST /v1/audio/transcriptions   speech -> text   (Moondream Parakeet Redux, CPU; or Parakeet TDT 0.6B v2 via sherpa-onnx with STT_BACKEND=sherpa)
     POST /v1/audio/speech           text -> speech   (Kokoro-82M ONNX, CPU)
     GET  /health                    warm-up / status
 
@@ -37,20 +37,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 # ------------------------------------------------------------------ settings (all overridable with env vars)
 API_KEY = os.getenv("API_KEY", "").strip()                    # clients send  Authorization: Bearer <API_KEY>
-STT_ENGINE = "faster-whisper"                                  # the ONLY speech-to-text engine (English)
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small.en")         # only used in logs / health: the model itself is baked into the image (see Dockerfile)
-WHISPER_DIR = os.getenv("WHISPER_DIR", "/models/whisper")
-WHISPER_THREADS = int(os.getenv("WHISPER_THREADS", "2"))       # = number of vCPUs, shared by all workers
-STT_WORKERS = max(1, int(os.getenv("STT_WORKERS", str(max(1, min(2, WHISPER_THREADS))))))  # recordings transcribed AT THE SAME TIME (one shared model, extra memory only for working space)
-WHISPER_BEAM = int(os.getenv("WHISPER_BEAM", "2"))             # 1 = greedy = fastest. 2 = good balance. 3-5 = best, slower
-WHISPER_VAD = os.getenv("WHISPER_VAD", "1") == "1"             # drop silence: fewer "Thank you." hallucinations
-WHISPER_HOTWORDS = " ".join(re.split(r"[,;|]+", os.getenv("WHISPER_HOTWORDS", ""))).strip()  # optional: names / terms you say often
-DENOISE = os.getenv("DENOISE", "auto").strip().lower()         # auto = clean only when the room is noisy, with a safety re-check | on | off
-SNR_CLEAN_DB = float(os.getenv("SNR_CLEAN_DB", "18"))          # recordings at or above this speech-to-noise ratio are never gated
-RETRY_LOGPROB = float(os.getenv("RETRY_LOGPROB", "-0.50"))     # below this confidence, the other audio version is tried too
+STT_BACKEND = os.getenv("STT_BACKEND", "redux").strip().lower()   # redux = Moondream Parakeet Redux (Photon, ~178 MB weights) | sherpa = Parakeet TDT 0.6B v2 int8 (English only, ~1.2-1.65 GB RAM)
+if STT_BACKEND not in ("redux", "sherpa"):
+    raise SystemExit(f"STT_BACKEND must be 'redux' or 'sherpa', not {STT_BACKEND!r}")
+STT_ENGINE = "moondream-parakeet-redux" if STT_BACKEND == "redux" else "parakeet-tdt-0.6b-v2"
+REDUX_MODEL = os.getenv("REDUX_MODEL", "moondream/parakeet-redux")  # Hugging Face id; weights are cached at build time (see fetch_stt.py)
+STT_DIR = os.getenv("STT_DIR", "/models/stt")                  # baked into the image (see Dockerfile / fetch_stt.py)
+STT_THREADS = int(os.getenv("STT_THREADS", "2"))               # = number of vCPUs, shared by all running recordings
+STT_WORKERS = max(1, int(os.getenv("STT_WORKERS", str(max(1, min(2, STT_THREADS))))))  # recordings transcribed AT THE SAME TIME
+if STT_BACKEND == "redux":
+    STT_WORKERS = 1        # Photon's thread-safety is not documented: one recording at a time, the rest wait in the queue (also saves RAM)
+VAD_MODE = os.getenv("VAD_MODE", "energy" if STT_BACKEND == "redux" else "neural").strip().lower()     # neural = Silero VAD network (falls back to energy if it cannot load) | energy = simple loudness rule
+VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))       # Silero speech probability needed to count as speech (0.3 = more sensitive, 0.7 = stricter)
+STT_SEPARATE_COPIES = os.getenv("STT_SEPARATE_COPIES", "0") == "1"  # 0 = all workers share ONE loaded model (about 1.2 GB). 1 = one model per worker (safest, +1.2 GB each)
 STT_QUEUE_MAX = int(os.getenv("STT_QUEUE_MAX", "8"))           # more than this many recordings waiting -> HTTP 429 (client retries) instead of a long hang
 TTS_WORKERS = max(1, int(os.getenv("TTS_WORKERS", "1")))       # sentences spoken at the same time (each copy of Kokoro needs ~0.55 GB RAM)
-MAX_AUDIO_SECONDS = float(os.getenv("MAX_AUDIO_SECONDS", "120"))  # protects the 2 GiB memory limit
+MAX_AUDIO_SECONDS = float(os.getenv("MAX_AUDIO_SECONDS", "120"))  # protects the memory limit
 TRIM_TTS = os.getenv("TRIM_TTS", "1") == "1"                  # cut dead air at the start/end of speech -> denser, snappier audio
 TTS_CACHE_MAX = int(os.getenv("TTS_CACHE_MAX", "64"))         # repeated sentences are served instantly
 KOKORO_MODEL = os.getenv("KOKORO_MODEL", "/models/kokoro.onnx")     # fp32 build. Do NOT use the int8 file: it outputs garbage
@@ -102,12 +104,38 @@ class Pool:
             self._q.put(item)
 
 
-_stt = {"model": None, "pool": None}
+_stt = {"pool": None}
 _tts = {"pool": None, "voices": set()}
 _tts_cache: "OrderedDict" = OrderedDict()
 
 
 # ------------------------------------------------------------------ model loading
+def _load_parakeet():
+    """NVIDIA Parakeet TDT 0.6B v2 (English) through sherpa-onnx (int8 ONNX, CPU)."""
+    import sherpa_onnx as so
+    d = STT_DIR
+    return so.OfflineRecognizer.from_transducer(
+        encoder=f"{d}/encoder.int8.onnx", decoder=f"{d}/decoder.int8.onnx", joiner=f"{d}/joiner.int8.onnx",
+        tokens=f"{d}/tokens.txt", num_threads=STT_THREADS, sample_rate=16000, feature_dim=80,
+        decoding_method="greedy_search", model_type="nemo_transducer", provider="cpu")
+
+
+_redux_cms = []     # keeps the Photon context managers alive for the whole life of the process
+
+
+def _load_redux():
+    """Moondream Parakeet Redux (ternary-quantised Parakeet, 25 languages, language picked automatically) through Photon, on CPU."""
+    import moondream as md
+    cm = md.photon(REDUX_MODEL, device="cpu")
+    speech = cm.__enter__()
+    _redux_cms.append(cm)
+    return speech
+
+
+def _load_stt():
+    return _load_redux() if STT_BACKEND == "redux" else _load_parakeet()
+
+
 def _log_memory(where: str):
     """Resident memory of this process, so you can read the real GB per model copy in the Cloud Run logs."""
     try:
@@ -120,11 +148,11 @@ def _log_memory(where: str):
 
 def load_models():
     t = time.time()
-    from faster_whisper import WhisperModel
-    per = max(1, WHISPER_THREADS // STT_WORKERS)               # CPU threads for each running recording
-    _stt["model"] = WhisperModel(WHISPER_DIR, device="cpu", compute_type="int8", cpu_threads=per, num_workers=STT_WORKERS)
-    _stt["pool"] = Pool([True] * STT_WORKERS, max_wait=STT_QUEUE_MAX)   # tokens: at most STT_WORKERS recordings run at once, the rest wait in line
-    log.info("whisper %s x%d workers (%d thread(s) each) loaded in %.1fs (%s)", WHISPER_MODEL, STT_WORKERS, per, time.time() - t, WHISPER_DIR)
+    first = _load_stt()
+    copies = [first] + [_load_stt() if STT_SEPARATE_COPIES else first for _ in range(STT_WORKERS - 1)]
+    _stt["pool"] = Pool(copies, max_wait=STT_QUEUE_MAX)      # at most STT_WORKERS recordings run at once, the rest wait in line
+    log.info("%s x%d worker(s), %s model copy/copies, loaded in %.1fs (%s)", STT_ENGINE, STT_WORKERS,
+             STT_WORKERS if STT_SEPARATE_COPIES else 1, time.time() - t, REDUX_MODEL if STT_BACKEND == "redux" else STT_DIR)
     _log_memory("after STT load")
 
     import onnxruntime as ort
@@ -148,12 +176,13 @@ def warm_up():
     try:
         rng = np.random.default_rng(0)
         probe = (0.05 * rng.standard_normal(16000 * 2)).astype(np.float32)   # not silence, so the encoder really runs
+        ths = []
         def _one():
-            list(_stt["model"].transcribe(probe, language="en", beam_size=WHISPER_BEAM, without_timestamps=True)[0])
-        ths = [threading.Thread(target=_one) for _ in range(STT_WORKERS)]   # every worker gets warmed
+            with _stt["pool"].take() as rec:
+                _stt_decode(rec, probe)
+        ths = [threading.Thread(target=_one) for _ in range(STT_WORKERS)]    # every worker gets warmed
         [t.start() for t in ths]
         [t.join() for t in ths]
-        ac.clean(probe)                                                       # warms numpy FFT paths too
         _synthesize_blocking("Hello.", EN_FEMALE, 1.0)
         _log_memory("after warm-up")
         log.info("warm-up done")
@@ -180,13 +209,18 @@ def _boot_models():
 async def lifespan(app):
     # PRELOAD=1 (default): load the models BEFORE the port opens. Cloud Run gives a starting container full CPU, but once the startup
     # check has passed it slows an idle container to almost nothing, so a background load stalled for 6-14 minutes (seen in the logs:
-    # "whisper loaded in 374.1s", "READY after 830.4s") and the first recordings waited 16 s for it. Loading first takes ~20-40 s at full CPU.
+    # "parakeet loaded in 374.1s", "READY after 830.4s") and the first recordings waited 16 s for it. Loading first takes ~20-40 s at full CPU.
     # PRELOAD=0: the old behaviour (open at once, load in the background; requests wait up to 90 s).
     if os.getenv("PRELOAD", "1") == "1":
         await run_in_threadpool(_boot_models)
     else:
         threading.Thread(target=_boot_models, daemon=True).start()
     yield
+    for cm in _redux_cms:                      # let Photon release its memory on shutdown
+        try:
+            cm.__exit__(None, None, None)
+        except Exception:
+            pass
 
 
 async def _require_ready():
@@ -255,7 +289,7 @@ def _decode(data: bytes) -> np.ndarray:
 
 
 def _prepare(audio: np.ndarray) -> np.ndarray:
-    """Clean the recording before Whisper hears it: remove DC offset and lift quiet microphones to a healthy level.
+    """Clean the recording before Parakeet hears it: remove DC offset and lift quiet microphones to a healthy level.
     Quiet / low-gain audio is a top cause of wrong words. Returns an empty array when there is no real sound."""
     if audio.size == 0:
         return audio
@@ -269,64 +303,95 @@ def _prepare(audio: np.ndarray) -> np.ndarray:
     return np.clip(audio, -1.0, 1.0).astype(np.float32)
 
 
-# Phrases Whisper invents out of silence / noise. Dropped only when the segment is also low-confidence.
-_HALLUCINATIONS = {
-    "thank you", "thanks", "thank you.", "thanks for watching", "thank you for watching", "bye", "bye.", "you",
-    "subtitles by the amara.org community", "please subscribe", "like and subscribe",
-}
+def _sherpa_decode(rec, audio: np.ndarray) -> str:
+    stream = rec.create_stream()                        # a stream belongs to ONE thread; the recognizer itself is shared
+    stream.accept_waveform(16000, audio)
+    rec.decode_stream(stream)
+    return stream.result.text.strip()
 
 
-def _is_hallucination(seg) -> bool:
-    t = re.sub(r"[\s.!,?।]+$", "", seg.text.strip().lower())
-    weak = seg.no_speech_prob > 0.35 or seg.avg_logprob < -0.9
-    return weak and t in _HALLUCINATIONS
+def _stt_decode(rec, audio: np.ndarray) -> str:
+    """One piece of 16 kHz mono float32 audio -> text, with whichever backend is loaded."""
+    if STT_BACKEND == "redux":
+        res = rec.transcribe(audio=audio, sample_rate=16000, timestamps="none")   # Photon splits >30 s audio at pauses by itself
+        return (res.get("text", "") if isinstance(res, dict) else str(res)).strip()
+    return _sherpa_decode(rec, audio)
 
 
-def _run_whisper(audio: np.ndarray, prompt: str):
-    """One Whisper pass. Returns (text, confidence, info). Confidence = average token log-probability (closer to 0 = surer)."""
-    segs, info = _stt["model"].transcribe(
-        audio,
-        language="en",
-        task="transcribe",
-        beam_size=WHISPER_BEAM, best_of=3,            # best_of only matters in the temperature fallback below
-        temperature=(0.0, 0.2, 0.4),                  # retry a failed / garbled window at a higher temperature
-        condition_on_previous_text=False,             # short utterances: stops repetition loops
-        initial_prompt=(prompt or None),
-        hotwords=(WHISPER_HOTWORDS or None),
-        vad_filter=WHISPER_VAD,
-        vad_parameters={"threshold": 0.45, "min_silence_duration_ms": 350,
-                        "speech_pad_ms": 250, "min_speech_duration_ms": 120},   # pad = never clip the first / last word
-        without_timestamps=True,                      # faster decoding, we only need text
-        no_speech_threshold=0.6,
-        log_prob_threshold=-1.0,
-        compression_ratio_threshold=2.2,              # catches "the the the the" loops
-        repetition_penalty=1.05,
-        no_repeat_ngram_size=0,
-        suppress_blank=True,
-    )
-    texts, lp, wt = [], 0.0, 0
-    for sg in segs:
-        t = sg.text.strip()
-        if not t or _is_hallucination(sg):
-            continue
-        texts.append(t)
-        w = max(1, len(sg.tokens or ()))
-        lp += sg.avg_logprob * w
-        wt += w
-    text = re.sub(r"\s+", " ", " ".join(texts)).strip()
-    return text, (lp / wt if wt else -9.0), info
+def _energy_segments(audio: np.ndarray):
+    """Fallback voice detection (numpy only): one span from the first to the last loud moment. [] when there is no speech."""
+    n = 320                                              # 20 ms frames
+    m = len(audio) // n
+    if m < 3:
+        return []
+    e = np.sqrt((audio[: m * n].reshape(m, n) ** 2).mean(axis=1))      # RMS per frame
+    noise = float(np.percentile(e, 10))
+    peak = float(np.percentile(e, 95))
+    thr = max(noise * 3.0, peak * 0.08, 0.004)           # well above the background, and a share of the loud part
+    voiced = np.flatnonzero(e > thr)
+    if voiced.size < 4 or peak < 0.01:                   # < ~80 ms of sound: not speech
+        return []
+    pad = 12                                             # 240 ms of padding: never clip the first / last word
+    a, b = max(0, voiced[0] - pad), min(m, voiced[-1] + 1 + pad)
+    return [audio[a * n: b * n]]
 
 
-def _audio_versions(audio: np.ndarray):
-    """The recording in the order we should try it: [(name, audio), ...]. See README 'Noise' for the reasoning."""
-    snr = ac.estimate_snr_db(audio)
-    plain = ac.clean(audio, gate=False)                       # high-pass only: safe for every recording
-    if DENOISE == "off":
-        return snr, [("plain", plain)]
-    gated = ac.clean(audio, gate=True)                        # + soft gate for steady background noise
-    if DENOISE == "on":
-        return snr, [("gated", gated), ("plain", plain)]
-    return snr, ([("plain", plain), ("gated", gated)] if snr >= SNR_CLEAN_DB else [("gated", gated), ("plain", plain)])
+def _neural_segments(audio: np.ndarray):
+    """Silero VAD (a small neural network, ~2 MB, run through sherpa-onnx) finds where people really talk.
+    Returns a list of speech pieces ([] = no speech at all), or None when the network is not available."""
+    try:
+        import sherpa_onnx as so
+        cfg = so.VadModelConfig()
+        cfg.silero_vad.model = os.path.join(STT_DIR, "silero_vad.onnx")
+        cfg.silero_vad.threshold = VAD_THRESHOLD
+        cfg.silero_vad.min_silence_duration = 0.5        # pauses shorter than this stay inside one piece (sentences are not chopped)
+        cfg.silero_vad.min_speech_duration = 0.15
+        cfg.silero_vad.max_speech_duration = 20.0        # very long speech is cut by the network at a pause
+        cfg.sample_rate = 16000
+        cfg.num_threads = 1
+        cfg.provider = "cpu"
+        vad = so.VoiceActivityDetector(cfg, buffer_size_in_seconds=MAX_AUDIO_SECONDS + 10)
+        w = 512                                          # Silero window at 16 kHz
+        for k in range(0, len(audio), w):
+            vad.accept_waveform(audio[k:k + w])
+        if hasattr(vad, "flush"):
+            vad.flush()
+        pad, pieces = 3200, []                           # 0.2 s of real audio on each side: never clip the first / last word
+        while not vad.empty():
+            seg = vad.front
+            start, n = getattr(seg, "start", None), len(seg.samples)
+            if start is None:
+                pieces.append(np.asarray(seg.samples, dtype=np.float32))
+            else:
+                pieces.append(audio[max(0, start - pad): min(len(audio), start + n + pad)])
+            vad.pop()
+        return pieces
+    except Exception as e:
+        log.warning("neural VAD unavailable, using the energy rule: %s", e)
+        return None
+
+
+def _speech_pieces(audio: np.ndarray):
+    """Pieces of the recording that contain speech. [] = only noise / silence."""
+    if VAD_MODE == "neural":
+        pieces = _neural_segments(audio)
+        if pieces is not None:
+            return pieces
+    return _energy_segments(audio)
+
+
+def _split_long(audio: np.ndarray, max_s: float = 20.0):
+    """Cut long recordings into pieces of at most ~20 s, always at the quietest moment (never mid-word)."""
+    n, k = int(max_s * 16000), 1600
+    out, start = [], 0
+    while len(audio) - start > n:
+        lo, hi = start + int(n * 0.7), start + n
+        level = np.convolve(np.abs(audio[lo:hi]), np.ones(k) / k, mode="valid")
+        cut = lo + int(np.argmin(level)) + k // 2
+        out.append(audio[start:cut])
+        start = cut
+    out.append(audio[start:])
+    return out
 
 
 def _transcribe_blocking(data: bytes, prompt: str = ""):
@@ -334,26 +399,25 @@ def _transcribe_blocking(data: bytes, prompt: str = ""):
     raw = _decode(data)
     qual = ac.describe(ac.stats(raw))                  # what the browser really sent (before our own level boost)
     audio = _prepare(raw)
-    if audio.size < 1600:                              # < 0.1 s or silence: nothing to transcribe
+    if audio.size < 1600:
         log.info("STT skipped: no speech in recording")
         return ""
-    with _stt["pool"].take():                          # waits here when all workers are busy
-        snr, versions = _audio_versions(audio)
-        name, ver = versions[0]
-        text, conf, info = _run_whisper(ver, prompt)
-        used = name
-        # Not sure about the result (or nothing heard)? Listen once more to the other version of the same recording and
-        # keep whichever Whisper is more confident about. Costs time only on hard recordings; clear speech never pays it.
-        if len(versions) > 1 and (conf < RETRY_LOGPROB or not text) and audio.size < 20 * 16000:
-            name2, ver2 = versions[1]
-            text2, conf2, _ = _run_whisper(ver2, prompt)
-            if text2 and (not text or conf2 > conf + 0.05):
-                text, conf, used = text2, conf2, name2
+    # No noise remover on purpose: published tests found that denoising networks make modern ASR (Parakeet, Whisper) WORSE.
+    pieces = _speech_pieces(audio)
+    if not pieces:
+        log.info("STT skipped: only noise, no speech")
+        return ""
+    audio = np.concatenate(pieces)                     # only used for the length in the log line below
+    with _stt["pool"].take() as rec:                   # waits here when all workers are busy
+        if STT_BACKEND == "redux":                     # Redux has its own VAD + chunking (<=30 s at pauses): hand it the whole speech span
+            text = _stt_decode(rec, audio) if len(audio) > 1600 else ""
+        else:
+            text = " ".join(_stt_decode(rec, sub) for piece in pieces for sub in _split_long(piece) if len(sub) > 1600)
+    text = re.sub(r"\s+", " ", text).strip()
     dt = time.time() - t0
-    log.info("STT[%s %s] %.1fs audio in %.2fs (x%.1f) %s used=%s conf=%.2f: %s", STT_ENGINE, WHISPER_MODEL, info.duration, dt,
-             info.duration / max(dt, 1e-3), qual, used, conf, text[:80])
+    log.info("STT[%s] %.1fs audio in %.2fs (x%.1f) %s: %s", STT_ENGINE, len(audio) / 16000, dt, len(audio) / 16000 / max(dt, 1e-3), qual, text[:80])
     if not text:
-        log.warning("STT heard NOTHING in %.1fs of audio (%s). Not English, too distorted, or only background / the assistant's own echo.", info.duration, qual)
+        log.warning("STT[%s] heard NOTHING in %.1fs of audio (%s). Not English, too distorted, or only background / the assistant's own echo.", STT_ENGINE, len(audio) / 16000, qual)
     return text
 
 
@@ -361,9 +425,9 @@ def _transcribe_blocking(data: bytes, prompt: str = ""):
 @app.post("/audio/transcriptions")
 async def transcriptions(
     file: UploadFile = File(...),
-    model: str = Form(""),                  # ignored: the Whisper model baked into the image is always used
-    language: str = Form(""),             # ignored: English only
-    prompt: str = Form(""),               # optional: spelling hints (names, terms) for Whisper
+    model: str = Form(""),                  # ignored: the server's own STT model is always used
+    language: str = Form(""),             # ignored: Redux detects the language itself (sherpa backend: English only)
+    prompt: str = Form(""),               # ignored
     temperature: float = Form(0.0),
     response_format: str = Form("json"),
     _: None = Depends(auth),
@@ -543,7 +607,7 @@ async def voices(_: None = Depends(auth)):
 @app.get("/health")
 async def health():
     return {"ok": _ready.is_set(), "loading": not _ready.is_set() and not _boot["error"], "error": _boot["error"],
-            "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": STT_ENGINE + ":" + WHISPER_MODEL,
-            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v10-faster-whisper", "engine": STT_ENGINE, "lang": "en",
+            "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": STT_ENGINE,
+            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v13-moondream-redux", "engine": STT_ENGINE, "lang": "en" if STT_BACKEND == "sherpa" else "auto", "vad": VAD_MODE,
             "stt_workers": STT_WORKERS, "stt_busy": _stt["pool"].active if _stt["pool"] else 0, "stt_waiting": _stt["pool"].waiting if _stt["pool"] else 0,
             "tts_workers": TTS_WORKERS}

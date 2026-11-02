@@ -6,4 +6,5 @@ lameenc==1.9.0
 numpy==2.4.4
 onnxruntime==1.24.4
 av==15.1.0
-faster-whisper==1.2.1
+sherpa-onnx==2.0.1
+moondream>=2.4.1

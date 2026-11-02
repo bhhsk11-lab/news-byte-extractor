@@ -8,8 +8,8 @@ REGION="${REGION:-asia-south1}"          # Mumbai: closest to India, and full fr
 SERVICE="${SERVICE:-news-byte-extractor}"
 KEY_FILE=".api_key"
 CPU="${CPU:-2}"                           # use  CPU=4 MEMORY=2Gi ./deploy.sh  for a faster (and dearer) server
-MEMORY="${MEMORY:-3Gi}"                   # 3 GiB: Whisper small.en (about 1 GB) + Kokoro (0.55 GB) + working space for 2 recordings
-STT_WORKERS="${STT_WORKERS:-2}"            # recordings transcribed at the same moment (1 = less RAM and CPU)
+MEMORY="${MEMORY:-1Gi}"                   # 1 GiB target: Parakeet Redux (weights 178 MB) + Kokoro (0.55 GB) + working space. NOT measured: read "MEMORY after ..." in the logs; if it is killed use MEMORY=2Gi
+STT_WORKERS="${STT_WORKERS:-1}"            # recordings transcribed at the same moment (Redux always uses 1; only the sherpa backend uses more)
 MAX_INSTANCES="${MAX_INSTANCES:-3}"       # extra servers start by themselves when many people talk at once (billed only while busy)
 
 [ -n "$PROJECT" ] || { echo "Pass your project id:  ./deploy.sh my-project-id"; exit 1; }
@@ -29,9 +29,9 @@ fi
 
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com --project "$PROJECT"
 
-# --cpu/--memory      : the 2 vCPU / 2 GiB you have
+# --cpu/--memory      : 2 vCPU / 1 GiB by default (see MEMORY above)
 # --max-instances 3   : hard cap on scaling (change with MAX_INSTANCES=1 ./deploy.sh to forbid scaling out)
-# --concurrency 4     : one server takes 4 requests at once (2 Whisper workers run in parallel, the rest wait a moment); more load -> new server
+# --concurrency 4     : one server takes 4 requests at once (Redux transcribes one at a time, the rest wait a moment); more load -> new server
 # --cpu-boost         : extra CPU while the container starts (faster cold start)
 # --min-instances 0   : scale to zero = nothing billed while you are not talking
 gcloud run deploy "$SERVICE" \
@@ -39,7 +39,7 @@ gcloud run deploy "$SERVICE" \
   --cpu "$CPU" --memory "$MEMORY" --cpu-boost \
   --min-instances 0 --max-instances "$MAX_INSTANCES" --concurrency 4 \
   --timeout 120 --allow-unauthenticated --labels app=cpu-voice \
-  --update-env-vars "API_KEY=${API_KEY},WHISPER_THREADS=${CPU},STT_WORKERS=${STT_WORKERS},KOKORO_THREADS=${CPU}"
+  --update-env-vars "API_KEY=${API_KEY},STT_THREADS=${CPU},STT_WORKERS=${STT_WORKERS},KOKORO_THREADS=${CPU}"
 
 URL="$(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format 'value(status.url)')"
 cat <<MSG

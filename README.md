@@ -1,11 +1,11 @@
 # Free voice assistant on Cloud Run (CPU only)
 
 A small server that gives your **AI Chat Firefox extension** a speaking and listening voice, running on your own
-Cloud Run service (2 vCPU / 2 GiB). No GPU. Nothing is billed while you are not talking.
+Cloud Run service (2 vCPU, 1 GiB target). No GPU. Nothing is billed while you are not talking.
 
 | Job | Model | Why |
 |---|---|---|
-| Speech → text | **faster-whisper** (Whisper `small.en`, int8, English). The only speech-to-text engine | Whisper accuracy, runs on CPU, MIT license |
+| Speech → text | **Moondream Parakeet Redux** (Parakeet 0.6B v3 with a ternary-quantised encoder, weights 178 MB, 25 languages, via Moondream's Photon engine). The only speech-to-text model in the default build | Small memory, fast on CPU, built-in voice detection and chunking |
 | Text → speech | **Kokoro-82M** (fp32, ONNX) | Natural English voice, runs on CPU |
 
 The extension already speaks the OpenAI speech API, so **no extension changes are needed**. You only paste a URL and a key.
@@ -53,9 +53,9 @@ Extension popup → **Speech engines & images**:
 | Speech & image API base URL | `https://news-byte-extractor-xxxxx-el.a.run.app/v1` (keep the `/v1`) |
 | Speech & image API key | the key from `.api_key` |
 | Speech input (your microphone) | **API** |
-| Transcription model | anything. The server ignores it (always the Whisper model baked into the image) |
+| Transcription model | anything. The server ignores it (always Parakeet Redux) |
 | Speech model | anything. The server ignores it |
-| Language I speak | *English*. This build is English only |
+| Language I speak | *English*. Redux picks the language itself and the server ignores this field (the model is multilingual; English is not enforced) |
 
 Firefox will ask permission to contact the new server: click **Allow**. Then pick a voice: any female name
 (Marin, Coral, Nova ...) gives the female Kokoro voice, any male name (Cedar, Ash ...) gives the male one.
@@ -80,8 +80,8 @@ Things that are **not** free, and what to do:
 * **`--min-instances 1`** keeps the server warm but bills idle time all month (roughly $25, by the idle rates on the pricing page). Leave it at 0.
 * The container image (about 2 GB) sits in Artifact Registry. Storage above its free amount costs cents per month.
 * Outbound audio is small (MP3 at 48 kbps, about 21 MB per hour of speech), so egress is pennies.
-* Because your account is upgraded (billing enabled), anything past the free tier is charged. `deploy.sh` sets
-  `--max-instances 1` so it can never scale into a big bill. Also set a **budget alert** of $1 to $5 in
+* Because your account is upgraded (billing enabled), anything past the free tier is charged. `deploy.sh` allows
+  `--max-instances 3` by default; use `MAX_INSTANCES=1 ./deploy.sh` so it can never scale into a big bill. Also set a **budget alert** of $1 to $5 in
   *Billing → Budgets & alerts*.
 
 ## Tuning
@@ -90,14 +90,13 @@ Change these with `gcloud run services update news-byte-extractor --region asia-
 
 | Setting | Default | When to change |
 |---|---|---|
-| `STT_WORKERS` | `2` | Recordings transcribed at the same moment. They share one Whisper model (extra RAM is only working space) and split the CPU threads: `WHISPER_THREADS / STT_WORKERS` each |
+| `STT_BACKEND` | `redux` | Set in the Dockerfile (`ARG STT_BACKEND`), because the build downloads that model. `sherpa` = the old English-only Parakeet TDT 0.6B v2 int8 (+ Silero VAD), needs about 1.2-1.65 GB RAM for STT alone |
+| `STT_WORKERS` | `1` | Recordings transcribed at the same moment. Redux always uses 1 |
+| `STT_SEPARATE_COPIES` | `0` | `0` = the workers share ONE loaded Parakeet (about 1.2 GB). `1` = one Parakeet per worker (+1.2 GB each, needs `MEMORY=5Gi`) |
+| `STT_THREADS` | `2` | CPU threads for speech-to-text (`deploy.sh` sets it from `CPU`) |
+| `VAD_MODE` | `energy` (redux) / `neural` (sherpa) | Redux has its own voice detection and cuts at pauses (max 30 s), so the server only uses the loudness rule to skip empty recordings. `neural` = Silero VAD, only for the sherpa backend |
+| `VAD_THRESHOLD` | `0.5` | Speech probability needed to count as speech. `0.3` if quiet speech is cut, `0.7` if noise gets through |
 | `STT_QUEUE_MAX` | `8` | If more recordings than this are waiting, the server answers HTTP 429 instead of hanging |
-| `WHISPER_BEAM` | `2` | `1` = fastest, `3`-`5` = most accurate, slower |
-| `WHISPER_HOTWORDS` | empty | Names / terms you say often, separated by `;`, e.g. `Jaipur;Claude;Kokoro` |
-| `DENOISE` | `auto` | `auto` = clean only noisy recordings and double-check unsure ones, `on` = always try the cleaned version first, `off` = never |
-| `SNR_CLEAN_DB` | `18` | Recordings cleaner than this are never noise-gated |
-| `RETRY_LOGPROB` | `-0.50` | If Whisper's confidence is below this, the other version of the recording is also tried |
-| `WHISPER_VAD` | `1` | `0` if it cuts off quiet speech |
 | `MAX_AUDIO_SECONDS` | `120` | Longest recording accepted |
 | `TTS_WORKERS` | `1` | Sentences spoken at the same moment. Each Kokoro copy needs about 0.55 GB RAM |
 | `TRIM_TTS` | `1` | Cuts silence at the start/end of speech |
@@ -105,29 +104,45 @@ Change these with `gcloud run services update news-byte-extractor --region asia-
 | `MP3_KBPS` | `48` | `64` = better sound, more data |
 | `VOICE_EN_FEMALE` / `VOICE_EN_MALE` | `af_heart` / `am_michael` | any Kokoro English id |
 
-## Speech-to-text: faster-whisper only (build `voice-v10-faster-whisper`)
+## Speech-to-text: Moondream Parakeet Redux (build `voice-v13-moondream-redux`)
 
-* The only speech-to-text engine is **faster-whisper** (Whisper through CTranslate2), int8, CPU, English. Moonshine, Parakeet and sherpa-onnx are removed.
-* The model is downloaded at **build time** (`fetch_stt.py`) and baked into the image. Choose it with `--build-arg WHISPER_MODEL=...` in the `Dockerfile` (`ARG WHISPER_MODEL=small.en`), then deploy again. Changing it only in Cloud Run settings does nothing.
+* Default model: **moondream/parakeet-redux**, run on CPU with `moondream.photon(..., device="cpu")`. It is NVIDIA's Parakeet 0.6B **v3** with the encoder weights reduced to -1/0/+1; weights shrink from 1.2 GB to 178 MB (per Moondream's release post, Sep 2026).
+* **Not English only.** It supports 25 languages and detects the language automatically. If someone speaks another language the server will transcribe that language. The old English-only v2 model is still available with `STT_BACKEND=sherpa`.
+* Accuracy, from Moondream's own tests (not run here): English average word error 6.55% (original v3: 6.26%); with background noise 9.04% (original: 6.72%). Redux is weaker in noise, so keep the microphone close and the room quiet. The README of the previous build quoted about 6.0% for v2 on a different benchmark, so those numbers cannot be compared directly.
+* Long recordings: Photon splits audio at pauses into chunks of at most 30 s. The server therefore sends the whole speech span in one call. Silero VAD is not used with Redux.
+* **Memory is not measured yet.** The logs print `MEMORY after STT load`, `after TTS load` and `after warm-up`: read them on the first deploy. Kokoro fp32 alone is about 0.55 GB, so 1 GiB total is tight. If Cloud Run reports `exceeded memory limit`, deploy with `MEMORY=2Gi`.
+* **Not tested here:** this build was written without network access, so the Photon calls (`md.photon`, `transcribe(audio=ndarray, sample_rate=16000, timestamps="none")`) follow Moondream's documentation but have not been run. Photon's own dependencies (for example whether it pulls in PyTorch, which would make the image much bigger and use more RAM) are also unchecked: look at the build log and the image size.
+* The model is loaded once at build time into the image (`fetch_stt.py`). If that download fails the build continues with a warning and the server downloads the weights at first start (slow cold start).
+* One recording is transcribed at a time (Photon's thread-safety is not documented); the others wait in the queue (`STT_QUEUE_MAX`).
+* **License:** CC-BY-4.0, same as NVIDIA's Parakeet. Keep the attribution: "Moondream Parakeet Redux, based on NVIDIA Parakeet TDT 0.6B v3". Check the Photon engine license on moondream.ai/photon before commercial use.
+* `/health` shows `"build": "voice-v13-moondream-redux"` and `"stt": "moondream-parakeet-redux"`.
 
-| Model | Notes |
-|---|---|
-| `base.en` | about twice as fast as small, lighter, a little less accurate |
-| `small.en` (default) | good accuracy, about 1.0 to 1.5 GB RAM |
-| `medium.en` | more accurate but too slow for live talking on 2 vCPU, and may not fit |
+### Going back to the old model
 
-From the Open ASR Leaderboard (English average word error, lower is better): Whisper large-v3 7.44, small.en 8.59, base.en 10.32, tiny.en 12.81.
+Set `ARG STT_BACKEND=sherpa` in the Dockerfile and deploy with `MEMORY=3Gi ./deploy.sh`. The sections below about Silero VAD, 1.2-1.65 GB memory and two workers describe that backend.
 
-* What the server does for accuracy: removes rumble, lifts quiet microphones, drops silence with the built-in Silero voice detector, filters phantom phrases such as "Thank you.", retries at a higher temperature for garbled windows, and listens to a second, cleaned version of the recording when it is unsure.
-* `/health` shows `"build": "voice-v10-faster-whisper"` and `"stt": "faster-whisper:small.en"`.
+## The audio neural networks: what is used, and what is not (internet check, Nov 2026; written for the sherpa backend)
+
+**How YouTube-style captions are made.** Google does not publish its pipeline. Secondary sources describe it as one large neural speech model trained on a huge amount of audio (RNN-T or Conformer type), then language-model rescoring and context biasing, then punctuation and casing, then confidence filtering. The accuracy comes from the size and training data of that one model, not from a separate noise-removal network in front of it. Parakeet TDT 0.6B v2 is the same kind of model (a FastConformer transducer with punctuation built in), so this server already has that part.
+
+**Added: a neural voice detector (Silero VAD).** A ~2 MB network decides where people really talk, and only those pieces go to Parakeet. Pauses under 0.5 s stay inside one piece, 0.2 s of real audio is kept around each piece so no first or last word is clipped, and speech longer than 20 s is cut at a pause chosen by the network (the old rule cut at the quietest moment). It is a voice detector, not a speech-to-text model, so Parakeet is still the only speech-to-text model. If the network file cannot load, the server falls back to the energy rule and logs `neural VAD unavailable`.
+
+**Deliberately NOT added: a noise-removal network (DeepFilterNet, MetricGAN, RNNoise, GTCRN ...).** Published tests say it makes accuracy worse for modern ASR:
+* A 2025 study with 500 recordings in nine noise conditions found that MetricGAN+ denoising raised the word error rate in all 30 tested setups. For Parakeet the increase was +1.4 to +5.9 points with background noise, up to +11.9 with white noise. Whisper was hurt more.
+* A 2026 study of a large audio-separation model with Whisper found better-sounding audio but higher word errors.
+* These tests used one enhancer (MetricGAN+) and one separation model (SAM-Audio), not every denoiser, and the authors say enhancement is not harmful in every setting. But I found no test showing a gain for Parakeet, so I did not ship one.
+
+**Deliberately NOT added: hotwords (context biasing) for Parakeet.** It is the closest thing to YouTube's context biasing. sherpa-onnx supports it for NeMo transducers, but needs `modified_beam_search`, and a fix in sherpa-onnx pull request 4084 describes that mode dropping speech for NeMo TDT models. I could not confirm that the fix is in version 2.0.1, so a silent loss of words is possible. Test it yourself before turning it on.
+
+**What really helps accuracy:** a good microphone close to your mouth, input volume that is not clipped (the log shows `clip=` and `snr=`), and no other people talking nearby.
 
 ## Parallel work and heavy load
 
-* **Inside one server:** `STT_WORKERS=2` (default) lets two recordings be transcribed at the same moment. This uses faster-whisper's `num_workers` (documented as true parallelism when `transcribe()` is called from several Python threads, at the cost of more memory). Others wait in line; past `STT_QUEUE_MAX` the server answers 429.
+* **Inside one server:** `STT_WORKERS=2` lets two recordings be transcribed at the same moment. By default both use the same loaded model: the sherpa-onnx maintainer states that one recognizer can be used by several threads, with a separate stream per recording (which this server does). I could not test real speed here, and I could not confirm that the Python layer lets both run truly in parallel. If `/health` shows `stt_busy` 2 but the log times look serial, set `STT_SEPARATE_COPIES=1` with `MEMORY=5Gi`.
 * **Across servers:** `deploy.sh` allows `MAX_INSTANCES=3` with `--concurrency 4`. Cloud Run starts extra servers by itself when load grows. Use `MAX_INSTANCES=1 ./deploy.sh` to forbid scaling out.
-* **Memory:** default `MEMORY=3Gi`. With `STT_WORKERS=1` you can use `2Gi`. Look in the logs for `MEMORY after STT load: X GB resident` to see the real number.
-* **CPU is shared:** with 2 vCPU and 2 workers each recording gets 1 thread, so one recording alone is slower than with `STT_WORKERS=1` (2 threads). Pick `1` if you are the only user, `2` for several users.
-* Text-to-speech stays at one sentence at a time per server (`TTS_WORKERS=1`). Speech-to-text and text-to-speech do run at the same time as each other.
+* **Waiting line:** past `STT_QUEUE_MAX` waiting recordings the server answers 429.
+* **Memory:** default `MEMORY=1Gi` (Redux). Use `MEMORY=3Gi` with the sherpa backend.
+* Text-to-speech stays at one sentence at a time per server (`TTS_WORKERS=1`); speech-to-text and text-to-speech do run at the same time as each other.
 * `/health` shows `stt_workers`, `stt_busy` and `stt_waiting`.
 
 ## Troubleshooting
@@ -137,9 +152,8 @@ From the Open ASR Leaderboard (English average word error, lower is better): Whi
 | Deploy fails with "failed to start and listen on PORT" | `gcloud run services logs read news-byte-extractor --region asia-south1 --limit 60`, look for `MODEL LOADING FAILED` |
 | First sentence takes 15 to 30 s | Cold start. Open `/health` first |
 | `401 Invalid API key` | The key in the extension differs from `.api_key` |
-| `Container ... exceeded memory limit` | Use `STT_WORKERS=1`, `WHISPER_MODEL=base.en`, or `MEMORY=4Gi` |
-| Names / rare words spelled wrong | Set `WHISPER_HOTWORDS=Name1;Name2`, or send them in the extension's prompt field |
-| Wrong words, or "heard NOTHING" in logs | Check the `peak= voice= snr= clip=` part of the log line: too quiet, clipped (microphone too loud) or noisy |
+| `Container ... exceeded memory limit` | Redeploy with `MEMORY=2Gi` (Redux) or `MEMORY=4Gi` (sherpa), and read the `MEMORY after ...` log lines |
+| Wrong words, or "heard NOTHING" in logs | Check the `peak= voice= snr= clip=` part of the log line: too quiet, clipped (microphone too loud) or noisy. Clipped audio turns words into other words: lower the microphone volume |
 | Silence from the speaker | Look for `bad audio ... skipped` in the logs |
 
 **Important:** do not swap in `kokoro-v1.0.int8.onnx`: it returned corrupt audio (NaN) in testing.
