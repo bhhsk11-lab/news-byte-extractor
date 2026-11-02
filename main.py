@@ -305,7 +305,9 @@ def _split_long(audio: np.ndarray, max_s: float = 20.0):
 
 def _transcribe_sherpa(data: bytes):
     t0 = time.time()
-    audio = _prepare(_decode(data))
+    raw = _decode(data)
+    qual = ac.describe(ac.stats(raw))                  # what the browser really sent (before our own level boost)
+    audio = _prepare(raw)
     if audio.size < 1600:
         log.info("STT skipped: no speech in recording")
         return ""
@@ -318,7 +320,9 @@ def _transcribe_sherpa(data: bytes):
         text = " ".join(_sherpa_decode(piece) for piece in _split_long(audio))
     text = re.sub(r"\s+", " ", text).strip()
     dt = time.time() - t0
-    log.info("STT[%s] %.1fs audio in %.2fs (x%.1f): %s", STT_ENGINE, len(audio) / 16000, dt, len(audio) / 16000 / max(dt, 1e-3), text[:80])
+    log.info("STT[%s] %.1fs audio in %.2fs (x%.1f) %s: %s", STT_ENGINE, len(audio) / 16000, dt, len(audio) / 16000 / max(dt, 1e-3), qual, text[:80])
+    if not text:
+        log.warning("STT[%s] heard NOTHING in %.1fs of audio (%s). Not English, too distorted, or only background / the assistant's own echo.", STT_ENGINE, len(audio) / 16000, qual)
     return text
 
 
@@ -393,8 +397,8 @@ def _transcribe_blocking(data: bytes, language: str, prompt: str):
             if text2 and (not text or conf2 > conf + 0.05):
                 text, conf, used = text2, conf2, name2
     dt = time.time() - t0
-    log.info("STT %.1fs audio in %.2fs (x%.1f) lang=%s snr=%.0fdB used=%s conf=%.2f: %s",
-             info.duration, dt, info.duration / max(dt, 1e-3), lang or info.language, snr, used, conf, text[:80])
+    log.info("STT %.1fs audio in %.2fs (x%.1f) lang=%s %s used=%s conf=%.2f: %s",
+             info.duration, dt, info.duration / max(dt, 1e-3), lang or info.language, ac.describe(ac.stats(audio)), used, conf, text[:80])
     return text
 
 
@@ -583,4 +587,4 @@ async def voices(_: None = Depends(auth)):
 async def health():
     return {"ok": _ready.is_set(), "loading": not _ready.is_set() and not _boot["error"], "error": _boot["error"],
             "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": (os.path.basename(WHISPER_DIR.rstrip("/")) if STT_ENGINE == "whisper" else STT_ENGINE),
-            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v6-fast", "engine": STT_ENGINE, "beam": WHISPER_BEAM, "langs": ALLOWED_LANGS}
+            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v6-fast-stats", "engine": STT_ENGINE, "beam": WHISPER_BEAM, "langs": ALLOWED_LANGS}

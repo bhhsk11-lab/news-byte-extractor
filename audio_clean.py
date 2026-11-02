@@ -77,3 +77,33 @@ def clean(x: np.ndarray, sr: int = SR, gate: bool = True, max_cut_db: float = 10
         S *= G.astype(np.float32)
     y = _istft(S, len(x))
     return np.clip(y, -1.0, 1.0).astype(np.float32)
+
+
+def stats(x: np.ndarray, sr: int = SR) -> dict:
+    """What the recording looks like when it reaches the recognizer (logged for every request, so wrong words can be traced to the audio).
+    peak_db / rms_db are dB below full scale; snr_db = loud 30 % of the frames vs the quietest 10 %; clip_pct = share of samples at the limit."""
+    if x.size == 0:
+        return {"dur": 0.0, "peak_db": -99.0, "rms_db": -99.0, "snr_db": 0.0, "clip_pct": 0.0}
+    x = x - float(np.mean(x))
+    peak = float(np.abs(x).max()) + 1e-9
+    n = int(0.02 * sr)
+    m = x.size // n
+    if m >= 5:
+        p = np.sort((x[: m * n].reshape(m, n) ** 2).mean(axis=1))
+        loud = p[-max(1, m * 3 // 10):].mean()
+    else:
+        loud = float((x ** 2).mean())
+    return {"dur": x.size / sr, "peak_db": 20 * float(np.log10(peak)), "rms_db": 10 * float(np.log10(loud + 1e-12)),
+            "snr_db": estimate_snr_db(x, sr), "clip_pct": 100.0 * float((np.abs(x) > 0.98).mean())}
+
+
+def describe(st: dict) -> str:
+    """One short line for the log + a plain warning when the recording itself is the likely problem."""
+    tips = []
+    if st["peak_db"] < -30 or st["rms_db"] < -45:
+        tips.append("VERY QUIET (raise the microphone level / move closer)")
+    if st["clip_pct"] > 0.5:
+        tips.append("CLIPPED (microphone too loud)")
+    if st["snr_db"] < 12:
+        tips.append("NOISY (voice is not much louder than the background)")
+    return "peak=%.0fdB voice=%.0fdB snr=%.0fdB clip=%.1f%%%s" % (st["peak_db"], st["rms_db"], st["snr_db"], st["clip_pct"], (" <-- " + ", ".join(tips)) if tips else "")
