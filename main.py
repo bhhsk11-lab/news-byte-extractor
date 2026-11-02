@@ -1,7 +1,7 @@
 """
 CPU voice server for Cloud Run  -  OpenAI-compatible speech API.
 
-    POST /v1/audio/transcriptions   speech -> text   (Moondream Parakeet Redux, CPU; or Parakeet TDT 0.6B v2 via sherpa-onnx with STT_BACKEND=sherpa)
+    POST /v1/audio/transcriptions   speech -> text   (NVIDIA Parakeet TDT 0.6B v2, int8, CPU, English only - the only STT model)
     POST /v1/audio/speech           text -> speech   (Kokoro-82M ONNX, CPU)
     GET  /health                    warm-up / status
 
@@ -37,17 +37,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 # ------------------------------------------------------------------ settings (all overridable with env vars)
 API_KEY = os.getenv("API_KEY", "").strip()                    # clients send  Authorization: Bearer <API_KEY>
-STT_BACKEND = os.getenv("STT_BACKEND", "redux").strip().lower()   # redux = Moondream Parakeet Redux (Photon, ~178 MB weights) | sherpa = Parakeet TDT 0.6B v2 int8 (English only, ~1.2-1.65 GB RAM)
-if STT_BACKEND not in ("redux", "sherpa"):
-    raise SystemExit(f"STT_BACKEND must be 'redux' or 'sherpa', not {STT_BACKEND!r}")
-STT_ENGINE = "moondream-parakeet-redux" if STT_BACKEND == "redux" else "parakeet-tdt-0.6b-v2"
-REDUX_MODEL = os.getenv("REDUX_MODEL", "moondream/parakeet-redux")  # Hugging Face id; weights are cached at build time (see fetch_stt.py)
+STT_ENGINE = "parakeet-tdt-0.6b-v2"                            # the ONLY speech-to-text model: NVIDIA Parakeet TDT 0.6B v2, 600 M parameters, English only, int8, CPU
 STT_DIR = os.getenv("STT_DIR", "/models/stt")                  # baked into the image (see Dockerfile / fetch_stt.py)
 STT_THREADS = int(os.getenv("STT_THREADS", "2"))               # = number of vCPUs, shared by all running recordings
 STT_WORKERS = max(1, int(os.getenv("STT_WORKERS", str(max(1, min(2, STT_THREADS))))))  # recordings transcribed AT THE SAME TIME
-if STT_BACKEND == "redux":
-    STT_WORKERS = 1        # Photon's thread-safety is not documented: one recording at a time, the rest wait in the queue (also saves RAM)
 VAD_MODE = os.getenv("VAD_MODE", "neural").strip().lower()     # neural = Silero VAD network (falls back to energy if it cannot load) | energy = simple loudness rule
+VAD_NET = os.getenv("VAD_NET", "silero").strip().lower()        # silero (default, MIT) | ten (TEN VAD, optional; falls back to silero if it cannot load)
 VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.4"))       # Silero speech probability needed to count as speech (0.3 = more sensitive, 0.7 = stricter)
 STT_SEPARATE_COPIES = os.getenv("STT_SEPARATE_COPIES", "0") == "1"  # 0 = all workers share ONE loaded model (about 1.2 GB). 1 = one model per worker (safest, +1.2 GB each)
 LEVELER = os.getenv("LEVELER", "1") == "1"                       # even out the loudness BEFORE the voice detector, so quiet sentences are not skipped
@@ -126,22 +121,6 @@ def _load_parakeet():
         decoding_method="greedy_search", model_type="nemo_transducer", provider="cpu")
 
 
-_redux_cms = []     # keeps the Photon context managers alive for the whole life of the process
-
-
-def _load_redux():
-    """Moondream Parakeet Redux (ternary-quantised Parakeet, 25 languages, language picked automatically) through Photon, on CPU."""
-    import moondream as md
-    cm = md.photon(REDUX_MODEL, device="cpu")
-    speech = cm.__enter__()
-    _redux_cms.append(cm)
-    return speech
-
-
-def _load_stt():
-    return _load_redux() if STT_BACKEND == "redux" else _load_parakeet()
-
-
 def _log_memory(where: str):
     """Resident memory of this process, so you can read the real GB per model copy in the Cloud Run logs."""
     try:
@@ -154,11 +133,11 @@ def _log_memory(where: str):
 
 def load_models():
     t = time.time()
-    first = _load_stt()
-    copies = [first] + [_load_stt() if STT_SEPARATE_COPIES else first for _ in range(STT_WORKERS - 1)]
+    first = _load_parakeet()
+    copies = [first] + [_load_parakeet() if STT_SEPARATE_COPIES else first for _ in range(STT_WORKERS - 1)]
     _stt["pool"] = Pool(copies, max_wait=STT_QUEUE_MAX)      # at most STT_WORKERS recordings run at once, the rest wait in line
     log.info("%s x%d worker(s), %s model copy/copies, loaded in %.1fs (%s)", STT_ENGINE, STT_WORKERS,
-             STT_WORKERS if STT_SEPARATE_COPIES else 1, time.time() - t, REDUX_MODEL if STT_BACKEND == "redux" else STT_DIR)
+             STT_WORKERS if STT_SEPARATE_COPIES else 1, time.time() - t, STT_DIR)
     _log_memory("after STT load")
 
     import onnxruntime as ort
@@ -222,11 +201,6 @@ async def lifespan(app):
     else:
         threading.Thread(target=_boot_models, daemon=True).start()
     yield
-    for cm in _redux_cms:                      # let Photon release its memory on shutdown
-        try:
-            cm.__exit__(None, None, None)
-        except Exception:
-            pass
 
 
 async def _require_ready():
@@ -320,10 +294,7 @@ def _sherpa_decode(rec, audio: np.ndarray) -> str:
 
 
 def _stt_decode(rec, audio: np.ndarray) -> str:
-    """One piece of 16 kHz mono float32 audio -> text, with whichever backend is loaded."""
-    if STT_BACKEND == "redux":
-        res = rec.transcribe(audio=audio, sample_rate=16000, timestamps="none")   # Photon splits >30 s audio at pauses by itself
-        return (res.get("text", "") if isinstance(res, dict) else str(res)).strip()
+    """One piece of 16 kHz mono float32 audio -> text (Parakeet TDT 0.6B v2)."""
     return _sherpa_decode(rec, audio)
 
 
@@ -367,16 +338,25 @@ def _neural_segments(audio: np.ndarray):
     Returns a list of speech pieces ([] = no speech at all), or None when the network is not available."""
     try:
         import sherpa_onnx as so
-        cfg = so.VadModelConfig()
-        cfg.silero_vad.model = os.path.join(STT_DIR, "silero_vad.onnx")
-        cfg.silero_vad.threshold = VAD_THRESHOLD
-        cfg.silero_vad.min_silence_duration = 0.5        # pauses shorter than this stay inside one piece (sentences are not chopped)
-        cfg.silero_vad.min_speech_duration = 0.15
-        cfg.silero_vad.max_speech_duration = PIECE_MAX_S   # long speech is cut by the network at a pause
-        cfg.sample_rate = 16000
-        cfg.num_threads = 1
-        cfg.provider = "cpu"
-        vad = so.VoiceActivityDetector(cfg, buffer_size_in_seconds=MAX_AUDIO_SECONDS + 10)
+        def _make(net: str):
+            cfg = so.VadModelConfig()
+            sub = cfg.ten_vad if net == "ten" else cfg.silero_vad
+            sub.model = os.path.join(STT_DIR, "ten-vad.onnx" if net == "ten" else "silero_vad.onnx")
+            sub.threshold = VAD_THRESHOLD
+            sub.min_silence_duration = 0.5               # pauses shorter than this stay inside one piece (sentences are not chopped)
+            sub.min_speech_duration = 0.15
+            sub.max_speech_duration = PIECE_MAX_S        # long speech is cut by the network at a pause
+            cfg.sample_rate = 16000
+            cfg.num_threads = 1
+            cfg.provider = "cpu"
+            return so.VoiceActivityDetector(cfg, buffer_size_in_seconds=MAX_AUDIO_SECONDS + 10)
+        try:
+            vad = _make(VAD_NET)
+        except Exception as e:
+            if VAD_NET == "silero":
+                raise
+            log.warning("VAD_NET=%s unavailable (%s), using silero", VAD_NET, e)
+            vad = _make("silero")
         w = 512                                          # Silero window at 16 kHz
         for k in range(0, len(audio), w):
             vad.accept_waveform(audio[k:k + w])
@@ -452,8 +432,8 @@ def _transcribe_blocking(data: bytes, prompt: str = ""):
 @app.post("/audio/transcriptions")
 async def transcriptions(
     file: UploadFile = File(...),
-    model: str = Form(""),                  # ignored: the server's own STT model is always used
-    language: str = Form(""),             # ignored: Redux detects the language itself (sherpa backend: English only)
+    model: str = Form(""),                  # ignored: Parakeet TDT 0.6B v2 is always used
+    language: str = Form(""),             # ignored: English only
     prompt: str = Form(""),               # ignored
     temperature: float = Form(0.0),
     response_format: str = Form("json"),
@@ -635,6 +615,6 @@ async def voices(_: None = Depends(auth)):
 async def health():
     return {"ok": _ready.is_set(), "loading": not _ready.is_set() and not _boot["error"], "error": _boot["error"],
             "seconds_since_start": round(time.time() - _boot["t0"], 1), "stt": STT_ENGINE,
-            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v14-moondream-redux-leveler", "engine": STT_ENGINE, "lang": "en" if STT_BACKEND == "sherpa" else "auto", "vad": VAD_MODE,
+            "tts": "kokoro-82m", "auth": bool(API_KEY), "build": "voice-v15-parakeet-v2-leveler", "engine": STT_ENGINE, "lang": "en", "vad": VAD_MODE,
             "stt_recovered": _stats["recovered"], "target_dbfs": TARGET_DBFS if LEVELER else None, "stt_workers": STT_WORKERS, "stt_busy": _stt["pool"].active if _stt["pool"] else 0, "stt_waiting": _stt["pool"].waiting if _stt["pool"] else 0,
             "tts_workers": TTS_WORKERS}

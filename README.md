@@ -1,11 +1,11 @@
 # Free voice assistant on Cloud Run (CPU only)
 
 A small server that gives your **AI Chat Firefox extension** a speaking and listening voice, running on your own
-Cloud Run service (2 vCPU, 1 GiB target). No GPU. Nothing is billed while you are not talking.
+Cloud Run service (2 vCPU, 3 GiB). No GPU. Nothing is billed while you are not talking.
 
 | Job | Model | Why |
 |---|---|---|
-| Speech → text | **Moondream Parakeet Redux** (Parakeet 0.6B v3 with a ternary-quantised encoder, weights 178 MB, 25 languages, via Moondream's Photon engine). The only speech-to-text model in the default build | Small memory, fast on CPU, built-in voice detection and chunking |
+| Speech → text | **NVIDIA Parakeet TDT 0.6B v2** (600 M parameters, English only, int8, via sherpa-onnx). The only speech-to-text model | High-speed offline dictation with native punctuation, runs on CPU |
 | Text → speech | **Kokoro-82M** (fp32, ONNX) | Natural English voice, runs on CPU |
 
 The extension already speaks the OpenAI speech API, so **no extension changes are needed**. You only paste a URL and a key.
@@ -53,9 +53,9 @@ Extension popup → **Speech engines & images**:
 | Speech & image API base URL | `https://news-byte-extractor-xxxxx-el.a.run.app/v1` (keep the `/v1`) |
 | Speech & image API key | the key from `.api_key` |
 | Speech input (your microphone) | **API** |
-| Transcription model | anything. The server ignores it (always Parakeet Redux) |
+| Transcription model | anything. The server ignores it (always Parakeet TDT 0.6B v2) |
 | Speech model | anything. The server ignores it |
-| Language I speak | *English*. Redux picks the language itself and the server ignores this field (the model is multilingual; English is not enforced) |
+| Language I speak | *English*. This build is English only |
 
 Firefox will ask permission to contact the new server: click **Allow**. Then pick a voice: any female name
 (Marin, Coral, Nova ...) gives the female Kokoro voice, any male name (Cedar, Ash ...) gives the male one.
@@ -90,8 +90,10 @@ Change these with `gcloud run services update news-byte-extractor --region asia-
 
 | Setting | Default | When to change |
 |---|---|---|
-| `STT_BACKEND` | `redux` | Set in the Dockerfile (`ARG STT_BACKEND`), because the build downloads that model. `sherpa` = the old English-only Parakeet TDT 0.6B v2 int8 (+ Silero VAD), needs about 1.2-1.65 GB RAM for STT alone |
-| `STT_WORKERS` | `1` | Recordings transcribed at the same moment. Redux always uses 1 |
+| `STT_WORKERS` | `2` | Recordings transcribed at the same moment |
+| `STT_SEPARATE_COPIES` | `0` | `0` = the workers share ONE loaded Parakeet (about 1.2 GB). `1` = one Parakeet per worker (+1.2 GB each, needs `MEMORY=5Gi`) |
+| `STT_THREADS` | `2` | CPU threads for speech-to-text (`deploy.sh` sets it from `CPU`) |
+| `VAD_NET` | `silero` | `silero` or `ten` (TEN VAD, optional and untested here; falls back to Silero if it cannot load) |
 | `STT_SEPARATE_COPIES` | `0` | `0` = the workers share ONE loaded Parakeet (about 1.2 GB). `1` = one Parakeet per worker (+1.2 GB each, needs `MEMORY=5Gi`) |
 | `STT_THREADS` | `2` | CPU threads for speech-to-text (`deploy.sh` sets it from `CPU`) |
 | `VAD_MODE` | `neural` | `neural` = Silero VAD network, `energy` = simple loudness rule (also the automatic fallback) |
@@ -110,35 +112,27 @@ Change these with `gcloud run services update news-byte-extractor --region asia-
 | `MP3_KBPS` | `48` | `64` = better sound, more data |
 | `VOICE_EN_FEMALE` / `VOICE_EN_MALE` | `af_heart` / `am_michael` | any Kokoro English id |
 
-## Speech-to-text: Moondream Parakeet Redux (build `voice-v14-moondream-redux-leveler`)
+## Speech-to-text: Parakeet TDT 0.6B v2 only (build `voice-v15-parakeet-v2-leveler`)
 
-* Default model: **moondream/parakeet-redux**, run on CPU with `moondream.photon(..., device="cpu")`. It is NVIDIA's Parakeet 0.6B **v3** with the encoder weights reduced to -1/0/+1; weights shrink from 1.2 GB to 178 MB (per Moondream's release post, Sep 2026).
-* **Not English only.** It supports 25 languages and detects the language automatically. If someone speaks another language the server will transcribe that language. The old English-only v2 model is still available with `STT_BACKEND=sherpa`.
-* Accuracy, from Moondream's own tests (not run here): English average word error 6.55% (original v3: 6.26%); with background noise 9.04% (original: 6.72%). Redux is weaker in noise, so keep the microphone close and the room quiet. The README of the previous build quoted about 6.0% for v2 on a different benchmark, so those numbers cannot be compared directly.
-* Long recordings: the server cuts speech at pauses (Silero VAD) into pieces of at most 12 s and decodes each piece alone (see "Level control and lost sentences").
-* **Memory is not measured yet.** The logs print `MEMORY after STT load`, `after TTS load` and `after warm-up`: read them on the first deploy. Kokoro fp32 alone is about 0.55 GB, so 1 GiB total is tight. If Cloud Run reports `exceeded memory limit`, deploy with `MEMORY=2Gi`.
-* **Not tested here:** this build was written without network access, so the Photon calls (`md.photon`, `transcribe(audio=ndarray, sample_rate=16000, timestamps="none")`) follow Moondream's documentation but have not been run. Photon's own dependencies (for example whether it pulls in PyTorch, which would make the image much bigger and use more RAM) are also unchecked: look at the build log and the image size.
-* The model is loaded once at build time into the image (`fetch_stt.py`). If that download fails the build continues with a warning and the server downloads the weights at first start (slow cold start).
-* One recording is transcribed at a time (Photon's thread-safety is not documented); the others wait in the queue (`STT_QUEUE_MAX`).
-* **License:** CC-BY-4.0, same as NVIDIA's Parakeet. Keep the attribution: "Moondream Parakeet Redux, based on NVIDIA Parakeet TDT 0.6B v3". Check the Photon engine license on moondream.ai/photon before commercial use.
-* `/health` shows `"build": "voice-v14-moondream-redux-leveler"` and `"stt": "moondream-parakeet-redux"`.
+* The only speech-to-text model is **parakeet-tdt-0.6b-v2**: 600 M parameters, English only, int8, CPU, via sherpa-onnx. Redux, Moondream, Whisper, faster-whisper and Moonshine are removed.
+* The output has capital letters, punctuation and digits ("25 minutes") written by the model itself.
+* The model file is downloaded at **build time** (`fetch_stt.py`) into the image, so a cold start only reads from disk.
+* Accuracy: about 6.0 average word error on the Open ASR Leaderboard (Whisper large-v3: about 7.4). Because it is English-only it was also the more robust Parakeet in tests found online: no lost speech in 20-30 s windows, where v3 lost some.
+* **Memory (measured earlier, one process): about 1.2 GB after start-up and 1.5 to 1.65 GB while transcribing a long recording, plus Kokoro 0.55 GB. This does NOT fit in 1 GiB.** `deploy.sh` defaults to `MEMORY=3Gi`; with `STT_WORKERS=1` try `MEMORY=2Gi` and read the `MEMORY after ...` log lines. The logs show `MEMORY after STT load: X GB resident`.
+* **License:** CC-BY-4.0. Keep the attribution: "NVIDIA Parakeet TDT 0.6B v2".
+* `/health` shows `"build": "voice-v15-parakeet-v2-leveler"` and `"stt": "parakeet-tdt-0.6b-v2"`.
 
-### Going back to the old model
-
-Set `ARG STT_BACKEND=sherpa` in the Dockerfile and deploy with `MEMORY=3Gi ./deploy.sh`. The sections below about Silero VAD, 1.2-1.65 GB memory and two workers describe that backend.
-
-## Level control and lost sentences (build `voice-v14`)
+## Level control and lost sentences
 
 What the internet check (Nov 2026) found, and what was done:
 
 * **Why quiet sentences vanish.** The speech model itself is fairly level-independent (it normalises its features per recording). What skips quiet sentences is everything in front of it: the silence gate, the voice detector and "loud enough" rules. The old energy rule dropped anything about 22 dB below the loudest moment. Fix: a slow automatic gain control (`audio_clean.level`) lifts quiet passages up to +40 dB (and lowers very loud ones by up to 12 dB) BEFORE the voice detector, then each speech piece is set to the same level (`normalize_piece`). Synthetic test: sentences at -10, -30 and -52 dBFS all reached the model at -20 dBFS. Background-only audio is not boosted on its own. A research paper on gain control also warns that badly chosen gain raises word errors, so the gain is smooth (about 0.2 s), has a ceiling, and a soft limiter instead of hard clipping.
 * **"50 dB".** A recording has no absolute sound pressure: dB SPL depends on the microphone and the room. The equivalent here is a fixed digital level. Default `TARGET_DBFS=-20` (a normal, healthy speech level). Change it with `TARGET_DBFS=-26 ./deploy.sh`-style env updates if you want it lower.
-* **Why whole sentences are lost (a second cause, found in several open-source projects, Oct-Nov 2026).** Parakeet TDT decoders sometimes return only blanks for several seconds of clear speech, especially after a pause of 1.5 s or more, in windows of 20-30 s, or when a window starts/ends right on the voice. Reports say Parakeet v3 (the base of Redux) loses speech at every window length tested (5 of 58 windows at 20 s), while v2 lost none up to 30 s. Fixes applied: speech is cut at pauses into pieces of at most 12 s (`PIECE_MAX_S`), long silences are never sent to the model, and a piece whose result looks too short (no words, or under 0.6 words per second in a piece of 4 s or more) is decoded again with 0.5 s of faint noise on both edges; the result with more words wins. `/health` shows `stt_recovered`, how many pieces this saved.
-* **Neural networks added:** Silero VAD (voice detector) now runs for both backends, with threshold 0.4. **Not added, on purpose:** a noise-removal network. A 2026 study found speech enhancement lowers Parakeet and Whisper accuracy in every tested case (the models were trained on noisy audio and do not know enhancement artefacts). A high-pass filter below about 70 Hz is applied; that is not a neural network and is safe.
-* **Accuracy honesty.** For English on a CPU, the old v2 backend (`STT_BACKEND=sherpa`) is more accurate and more robust than Redux (Moondream's own numbers: Redux 6.55% vs 6.26% for v3 on English, 9.04% vs 6.72% in noise; v2 about 6.0% on the Open ASR Leaderboard) but needs about 1.2-1.65 GB of RAM. Redux is chosen here for the 1 GB limit.
-* **Untested options for later.** A third-party package `voxrt` (Rust runtime for Redux, Apache-2.0, Linux x86-64 wheels, no PyTorch) and community ONNX exports of Redux exist; they could use less RAM than Photon, but were not tested here.
+* **Why whole sentences are lost (a second cause, found in several open-source projects, Oct-Nov 2026).** Parakeet TDT decoders sometimes return only blanks for several seconds of clear speech, especially after a pause of 1.5 s or more, in windows of 20-30 s, or when a window starts/ends right on the voice. Reports say v3 loses speech at every window length tested (5 of 58 windows at 20 s), while v2 lost none up to 30 s; v2 still has the pause problem, so the fixes below stay on. Fixes applied: speech is cut at pauses into pieces of at most 12 s (`PIECE_MAX_S`), long silences are never sent to the model, and a piece whose result looks too short (no words, or under 0.6 words per second in a piece of 4 s or more) is decoded again with 0.5 s of faint noise on both edges; the result with more words wins. `/health` shows `stt_recovered`, how many pieces this saved.
+* **Neural networks (internet check, Nov 2026).** In front of the speech model, only a voice detector helped in the evidence found: **Silero VAD** (about 2 MB, MIT licence) runs through sherpa-onnx, threshold 0.4. **TEN VAD** is an optional alternative (`VAD_NET=ten`): its authors report better precision and lower delay, but Silero's own benchmark reports the opposite (0.97 vs 0.93 ROC-AUC, and much better on pure-noise clips: 0.87 vs 0.42). Because the vendors disagree and I could not test it here, Silero stays the default. **Not added, on purpose:** noise-removal or speech-enhancement networks (DeepFilterNet, MetricGAN, RNNoise, SAM-Audio ...). A 2026 study found enhancement lowered Parakeet and Whisper accuracy in every tested case. A high-pass filter below about 70 Hz is applied; that is not a neural network and is safe.
+* **A second speech-to-text model as a "checker"** was not added: you asked for v2 only, and a second model would need more RAM.
 
-## The audio neural networks: what is used, and what is not (internet check, Nov 2026; written for the sherpa backend)
+## The audio neural networks: what is used, and what is not (internet check, Nov 2026)
 
 **How YouTube-style captions are made.** Google does not publish its pipeline. Secondary sources describe it as one large neural speech model trained on a huge amount of audio (RNN-T or Conformer type), then language-model rescoring and context biasing, then punctuation and casing, then confidence filtering. The accuracy comes from the size and training data of that one model, not from a separate noise-removal network in front of it. Parakeet TDT 0.6B v2 is the same kind of model (a FastConformer transducer with punctuation built in), so this server already has that part.
 
@@ -158,7 +152,7 @@ What the internet check (Nov 2026) found, and what was done:
 * **Inside one server:** `STT_WORKERS=2` lets two recordings be transcribed at the same moment. By default both use the same loaded model: the sherpa-onnx maintainer states that one recognizer can be used by several threads, with a separate stream per recording (which this server does). I could not test real speed here, and I could not confirm that the Python layer lets both run truly in parallel. If `/health` shows `stt_busy` 2 but the log times look serial, set `STT_SEPARATE_COPIES=1` with `MEMORY=5Gi`.
 * **Across servers:** `deploy.sh` allows `MAX_INSTANCES=3` with `--concurrency 4`. Cloud Run starts extra servers by itself when load grows. Use `MAX_INSTANCES=1 ./deploy.sh` to forbid scaling out.
 * **Waiting line:** past `STT_QUEUE_MAX` waiting recordings the server answers 429.
-* **Memory:** default `MEMORY=1Gi` (Redux). Use `MEMORY=3Gi` with the sherpa backend.
+* **Memory:** default `MEMORY=3Gi`.
 * Text-to-speech stays at one sentence at a time per server (`TTS_WORKERS=1`); speech-to-text and text-to-speech do run at the same time as each other.
 * `/health` shows `stt_workers`, `stt_busy` and `stt_waiting`.
 
@@ -169,7 +163,7 @@ What the internet check (Nov 2026) found, and what was done:
 | Deploy fails with "failed to start and listen on PORT" | `gcloud run services logs read news-byte-extractor --region asia-south1 --limit 60`, look for `MODEL LOADING FAILED` |
 | First sentence takes 15 to 30 s | Cold start. Open `/health` first |
 | `401 Invalid API key` | The key in the extension differs from `.api_key` |
-| `Container ... exceeded memory limit` | Redeploy with `MEMORY=2Gi` (Redux) or `MEMORY=4Gi` (sherpa), and read the `MEMORY after ...` log lines |
+| `Container ... exceeded memory limit` | Raise `MEMORY=4Gi`, or use `STT_WORKERS=1`, and read the `MEMORY after ...` log lines |
 | Wrong words, or "heard NOTHING" in logs | Check the `peak= voice= snr= clip=` part of the log line: too quiet, clipped (microphone too loud) or noisy. Clipped audio turns words into other words: lower the microphone volume |
 | Silence from the speaker | Look for `bad audio ... skipped` in the logs |
 
